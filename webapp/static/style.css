@@ -1,0 +1,176 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 1rem;
+  background: #f5f5f5;
+}
+
+header {
+  margin-bottom: 1.5rem;
+}
+
+header h1 {
+  margin: 0 0 0.25rem 0;
+  font-size: 1.5rem;
+}
+
+.subtitle {
+  margin: 0;
+  color: #555;
+  font-size: 0.95rem;
+}
+
+.upload-zone {
+  display: block;
+  border: 2px dashed #999;
+  border-radius: 8px;
+  padding: 2rem;
+  text-align: center;
+  background: #fff;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.upload-zone:hover {
+  border-color: #666;
+  background: #fafafa;
+}
+
+.upload-zone.dragover {
+  border-color: #069;
+  background: #e8f4f8;
+}
+
+#upload-text {
+  color: #555;
+}
+
+.error {
+  color: #c00;
+  margin-top: 0.5rem;
+}
+
+#map-section {
+  margin-top: 1rem;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.time-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+#time-label {
+  min-width: 140px;
+  font-weight: 500;
+}
+
+.time-slider-row {
+  margin-top: 0.75rem;
+  padding: 0.5rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.slider-btn {
+  flex-shrink: 0;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.9rem;
+  cursor: pointer;
+  background: #069;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+}
+
+.slider-btn:hover:not(:disabled) {
+  background: #057;
+}
+
+.slider-btn:disabled {
+  background: #999;
+  cursor: not-allowed;
+}
+
+#time-slider {
+  flex: 1;
+  min-width: 0;
+  max-width: 900px;
+  height: 8px;
+  cursor: pointer;
+  accent-color: #069;
+}
+
+#time-slider:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.mode-controls label {
+  margin-right: 1rem;
+  cursor: pointer;
+}
+
+.actions {
+  margin-left: auto;
+}
+
+.button {
+  display: inline-block;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.9rem;
+  background: #0a6;
+  color: #fff;
+  text-decoration: none;
+  border-radius: 4px;
+}
+
+.button:hover {
+  background: #085;
+}
+
+.map-container {
+  position: relative;
+  width: 100%;
+  max-width: 900px;
+  background: #ddd;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+#frame-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  vertical-align: top;
+}
+
+#click-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  pointer-events: auto;
+}
+
+#track-info {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  color: #555;
+}
