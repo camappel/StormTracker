@@ -8,7 +8,7 @@ import tempfile
 import time
 import uuid
 import warnings
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 import imageio.v2 as imageio
@@ -46,6 +46,7 @@ WATER_LEVEL_DIR = ANALYSIS_OUTPUT_DIR / "water_level_plots"
 ERA5_DIR = ROOT_DIR / "2_DATA" / "4_ERA5_API"
 
 COMBINED_TRACKS_PATH = ANALYSIS_OUTPUT_DIR / "storm_tracks_labeled_web.csv"
+GIF_OUTPUT_DIR = ANALYSIS_OUTPUT_DIR / "era5_gifs"
 
 app = FastAPI(title="StormTracker ERA5 Web App")
 app.add_middleware(
@@ -529,13 +530,61 @@ class StartStormSessionBody(BaseModel):
 
 def _parse_iso_utc(dt_str: str) -> datetime:
     try:
-        # Accept with or without trailing 'Z'
         s = dt_str.strip()
         if s.endswith("Z"):
-            s = s[:-1]
-        return datetime.fromisoformat(s)
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            # Backward compatibility: treat naive timestamps as UTC.
+            return dt
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
     except Exception:
         raise HTTPException(status_code=400, detail=f"Invalid datetime format: {dt_str!r}")
+
+
+def _era5_hours_for_day(day: date, start_dt: datetime, end_dt: datetime) -> list[int]:
+    start_day = start_dt.date()
+    end_day = end_dt.date()
+    if start_day == end_day:
+        return list(range(start_dt.hour, end_dt.hour + 1))
+    if day == start_day:
+        return list(range(start_dt.hour, 24))
+    if day == end_day:
+        return list(range(0, end_dt.hour + 1))
+    return list(range(24))
+
+
+def _build_era5_request_segments(start_dt: datetime, end_dt: datetime) -> list[dict]:
+    """
+    Build CDS request segments where each segment has one month and one shared hour list.
+    This avoids dropping interior hours while still honoring boundary-day hour limits.
+    """
+    segments = []
+    cur_day = start_dt.date()
+    end_day = end_dt.date()
+    while cur_day <= end_day:
+        y = cur_day.year
+        m = cur_day.month
+        hours = _era5_hours_for_day(cur_day, start_dt, end_dt)
+        day_start = cur_day.day
+        day_end = cur_day.day
+        probe = cur_day + timedelta(days=1)
+        while probe <= end_day and probe.year == y and probe.month == m:
+            probe_hours = _era5_hours_for_day(probe, start_dt, end_dt)
+            if probe_hours != hours:
+                break
+            day_end = probe.day
+            probe = probe + timedelta(days=1)
+        segments.append(
+            {
+                "year": y,
+                "month": m,
+                "days": list(range(day_start, day_end + 1)),
+                "hours": hours,
+            }
+        )
+        cur_day = probe
+    return segments
 
 
 @app.post("/api/storm/start-session")
@@ -565,22 +614,15 @@ async def api_start_storm_session(body: StartStormSessionBody):
             detail="cdsapi is not installed on the server; cannot download ERA5 automatically.",
         )
 
-    start_date = t_start.date()
-    end_date = t_end.date()
-    same_day = start_date == end_date
-    if same_day:
-        hours_in_range = list(range(t_start.hour, t_end.hour + 1))
-    else:
-        hours_in_range = list(range(24))
-    if not hours_in_range:
-        raise HTTPException(status_code=400, detail="Invalid time range")
-
     ERA5_DIR.mkdir(parents=True, exist_ok=True)
     era5_path.unlink(missing_ok=True)
     client = cdsapi.Client()
+    segments = _build_era5_request_segments(t_start, t_end)
+    if not segments:
+        raise HTTPException(status_code=400, detail="Invalid time range")
 
-    if start_date.year == end_date.year and start_date.month == end_date.month:
-        days_in_range = list(range(start_date.day, end_date.day + 1))
+    part_paths = []
+    for i, seg in enumerate(segments):
         request = {
             "product_type": "reanalysis",
             "variable": [
@@ -588,56 +630,40 @@ async def api_start_storm_session(body: StartStormSessionBody):
                 "10m_u_component_of_wind",
                 "10m_v_component_of_wind",
             ],
-            "year": [f"{t_start.year:04d}"],
-            "month": [f"{t_start.month:02d}"],
-            "day": [f"{d:02d}" for d in days_in_range],
-            "time": [f"{h:02d}:00" for h in hours_in_range],
+            "year": [f"{seg['year']:04d}"],
+            "month": [f"{seg['month']:02d}"],
+            "day": [f"{d:02d}" for d in seg["days"]],
+            "time": [f"{h:02d}:00" for h in seg["hours"]],
             "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
             "format": "netcdf",
         }
-        client.retrieve("reanalysis-era5-single-levels", request).download(str(era5_path))
-    else:
-        paths_to_merge = []
-        cur = start_date
-        while cur <= end_date:
-            y, m = cur.year, cur.month
-            month_end = date(y, m + 1, 1) - timedelta(days=1) if m < 12 else date(y, 12, 31)
-            d_start = cur.day if (cur.year, cur.month) == (start_date.year, start_date.month) else 1
-            d_end = end_date.day if (end_date.year, end_date.month) == (y, m) else month_end.day
-            if cur == start_date and start_date != end_date:
-                use_hours = list(range(t_start.hour, 24))
-            elif (end_date.year, end_date.month, end_date.day) == (y, m, d_end) and start_date != end_date:
-                use_hours = list(range(0, t_end.hour + 1))
-            else:
-                use_hours = list(range(24))
-            request = {
-                "product_type": "reanalysis",
-                "variable": [
-                    "mean_sea_level_pressure",
-                    "10m_u_component_of_wind",
-                    "10m_v_component_of_wind",
-                ],
-                "year": [f"{y:04d}"],
-                "month": [f"{m:02d}"],
-                "day": [f"{d:02d}" for d in range(d_start, d_end + 1)],
-                "time": [f"{h:02d}:00" for h in use_hours],
-                "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
-                "format": "netcdf",
-            }
-            part_path = ERA5_DIR / f"ERA5_{storm_id}_{y:04d}{m:02d}_part.nc"
-            client.retrieve("reanalysis-era5-single-levels", request).download(str(part_path))
-            paths_to_merge.append(part_path)
-            cur = month_end + timedelta(days=1)
-        if len(paths_to_merge) == 1:
-            paths_to_merge[0].rename(era5_path)
-        else:
-            ds_list = [xr.open_dataset(p) for p in paths_to_merge]
-            combined = xr.concat(sorted(ds_list, key=lambda d: d["valid_time"].values[0]), dim="valid_time")
-            for ds in ds_list:
-                ds.close()
-            combined.to_netcdf(era5_path)
-            for p in paths_to_merge:
-                p.unlink(missing_ok=True)
+        first_day = seg["days"][0]
+        last_day = seg["days"][-1]
+        first_hour = seg["hours"][0]
+        last_hour = seg["hours"][-1]
+        part_path = ERA5_DIR / (
+            f"ERA5_{storm_id}_{seg['year']:04d}{seg['month']:02d}_"
+            f"{first_day:02d}-{last_day:02d}_{first_hour:02d}-{last_hour:02d}_{i:02d}.nc"
+        )
+        client.retrieve("reanalysis-era5-single-levels", request).download(str(part_path))
+        part_paths.append(part_path)
+
+    valid_time_start = np.datetime64(t_start)
+    valid_time_end = np.datetime64(t_end)
+    ds_list = [xr.open_dataset(p) for p in part_paths]
+    try:
+        combined = xr.concat(sorted(ds_list, key=lambda d: d["valid_time"].values[0]), dim="valid_time")
+        combined = combined.sortby("valid_time")
+        combined = combined.sel(valid_time=slice(valid_time_start, valid_time_end))
+        if int(combined.sizes.get("valid_time", 0)) == 0:
+            raise HTTPException(status_code=500, detail="Downloaded ERA5 data does not cover requested time range.")
+        combined.to_netcdf(era5_path)
+        combined.close()
+    finally:
+        for ds in ds_list:
+            ds.close()
+        for p in part_paths:
+            p.unlink(missing_ok=True)
 
     return _create_session_from_era5(era5_path, storm_id=storm_id)
 
@@ -813,7 +839,17 @@ async def api_era5_gif(session_id: str):
     # Use FPS similar to analysis notebook GIFs
     imageio.mimsave(out, frames, format="GIF", loop=0, fps=4)
     out.seek(0)
-    return Response(content=out.read(), media_type="image/gif")
+    gif_bytes = out.read()
+
+    # Option B: save to output dir (era5_gifs/)
+    storm_id = session.get("storm_id")
+    safe_name = f"era5_storm_{storm_id}.gif" if storm_id is not None else f"era5_session_{session_id}.gif"
+    GIF_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (GIF_OUTPUT_DIR / safe_name).write_bytes(gif_bytes)
+
+    # Option A: suggest filename when opening in new tab or downloading
+    headers = {"Content-Disposition": f'attachment; filename="{safe_name}"'}
+    return Response(content=gif_bytes, media_type="image/gif", headers=headers)
 
 
 @app.post("/api/combined/save/{session_id}")

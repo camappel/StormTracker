@@ -64,6 +64,7 @@
   const trackInfo = document.getElementById('track-info');
   const gifSection = document.getElementById('gif-section');
   const btnGenerateGif = document.getElementById('btn-generate-gif');
+  const btnDownloadGif = document.getElementById('btn-download-gif');
   const gifStatus = document.getElementById('gif-status');
   const gifPreviewWrap = document.getElementById('gif-preview-wrap');
   const gifImg = document.getElementById('era5-gif');
@@ -275,6 +276,9 @@
     if (btnGenerateGif) {
       btnGenerateGif.disabled = !state.sessionId || n === 0;
     }
+    if (btnDownloadGif) {
+      btnDownloadGif.disabled = !state.sessionId || n === 0;
+    }
   }
 
   function updateDownloadLink() {
@@ -297,6 +301,9 @@
     if (gifStatus) {
       gifStatus.textContent = '';
       gifStatus.hidden = true;
+    }
+    if (btnDownloadGif) {
+      btnDownloadGif.disabled = true;
     }
   }
 
@@ -335,6 +342,26 @@
       if (btnGenerateGif) {
         btnGenerateGif.disabled = !state.sessionId || !state.track.length;
       }
+    }
+  }
+
+  async function downloadGif() {
+    if (!state.sessionId || !state.track.length) return;
+    const url = `${API}/api/gif/era5/${state.sessionId}`;
+    const filename = `era5_storm_${state.selectedStormId != null ? state.selectedStormId : state.sessionId}.gif`;
+    try {
+      showGifStatus('Preparing download…');
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(res.statusText);
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      showGifStatus('');
+    } catch (e) {
+      showGifStatus('Download failed: ' + e.message);
     }
   }
 
@@ -513,11 +540,30 @@
     endUtcInput.value = nextEnd;
     if (era5StartInput) era5StartInput.value = isoToLocalInputValue(nextStart);
     if (era5EndInput) era5EndInput.value = isoToLocalInputValue(nextEnd);
+    updateEra5ApplyButtonDirtyState();
+  }
+
+  function updateEra5ApplyButtonDirtyState() {
+    if (!btnEra5Apply) return;
+    const pendingStartIso = localInputValueToIso(era5StartInput ? era5StartInput.value : '');
+    const pendingEndIso = localInputValueToIso(era5EndInput ? era5EndInput.value : '');
+    const committedStartIso = state.era5StartUtc || null;
+    const committedEndIso = state.era5EndUtc || null;
+    const isDirty = pendingStartIso !== committedStartIso || pendingEndIso !== committedEndIso;
+    btnEra5Apply.classList.toggle('era5-apply-dirty', isDirty);
+  }
+
+  function commitEra5Window(startIso, endIso) {
+    const nextStart = startIso && startIso.trim ? startIso.trim() : '';
+    const nextEnd = endIso && endIso.trim ? endIso.trim() : '';
+    state.era5StartUtc = nextStart || null;
+    state.era5EndUtc = nextEnd || null;
+    setEra5Window(nextStart, nextEnd);
   }
 
   function syncSessionToEra5Window() {
-    const startIso = startUtcInput.value;
-    const endIso = endUtcInput.value;
+    const startIso = state.era5StartUtc;
+    const endIso = state.era5EndUtc;
     if (!startIso || !endIso) return;
     showApiStatus('Updating ERA5 window: downloading data…');
     startStormSessionAutomatically(true);
@@ -606,8 +652,8 @@
   async function startStormSessionAutomatically(force) {
     clearError();
     if (!state.selectedStormId) return;
-    const startIso = startUtcInput.value && startUtcInput.value.trim() ? startUtcInput.value.trim() : null;
-    const endIso = endUtcInput.value && endUtcInput.value.trim() ? endUtcInput.value.trim() : null;
+    const startIso = state.era5StartUtc;
+    const endIso = state.era5EndUtc;
     if (!startIso || !endIso) return;
     if (new Date(endIso) <= new Date(startIso)) {
       showError('End time must be after start time.');
@@ -763,8 +809,8 @@
         }
       };
     };
-    const era5Start = state.era5StartUtc || startIso;
-    const era5End = state.era5EndUtc || endIso;
+    const era5Start = state.era5StartUtc;
+    const era5End = state.era5EndUtc;
     addLine(waterAnnotations, 'era5-start-line', era5Start, 'rgba(0, 120, 200, 0.9)', 'ERA5 Start', false);
     addLine(waterAnnotations, 'era5-end-line', era5End, 'rgba(0, 120, 200, 0.9)', 'ERA5 End', false);
     stormWindows.forEach(function (win, i) {
@@ -970,12 +1016,7 @@
     state.lastAutoStartKey = null;
     state.waterSeries = [];
     state.stormWindows = [];
-    state.era5StartUtc = null;
-    state.era5EndUtc = null;
-    startUtcInput.value = '';
-    endUtcInput.value = '';
-    if (era5StartInput) era5StartInput.value = '';
-    if (era5EndInput) era5EndInput.value = '';
+    commitEra5Window('', '');
     if (chartRangeStartSelect) chartRangeStartSelect.innerHTML = '';
     if (chartRangeEndSelect) chartRangeEndSelect.innerHTML = '';
     if (activeFirstFrameEl) activeFirstFrameEl.textContent = '—';
@@ -1029,13 +1070,11 @@
         const defaults = computeDefaultWindows(series);
         if (defaults) {
           // ERA5 window defaults to 24h before/after barrier.
-          state.era5StartUtc = defaults.era5StartUtc;
-          state.era5EndUtc = defaults.era5EndUtc;
-          setEra5Window(defaults.era5StartUtc, defaults.era5EndUtc);
+          commitEra5Window(defaults.era5StartUtc, defaults.era5EndUtc);
           populateChartRangeControls();
           applyChartRange(defaults.mainStartUtc, defaults.mainEndUtc);
         } else {
-          setEra5Window('', '');
+          commitEra5Window('', '');
           populateChartRangeControls();
           if (series.length) {
             applyChartRange(series[0].time_utc, series[series.length - 1].time_utc);
@@ -1054,6 +1093,11 @@
   if (btnGenerateGif) {
     btnGenerateGif.addEventListener('click', () => {
       generateGif();
+    });
+  }
+  if (btnDownloadGif) {
+    btnDownloadGif.addEventListener('click', () => {
+      downloadGif();
     });
   }
 
@@ -1136,14 +1180,20 @@
         return;
       }
       clearError();
-      state.era5StartUtc = startIso;
-      state.era5EndUtc = endIso;
-      setEra5Window(startIso, endIso);
-      updateEra5LineAnnotations(startIso, endIso);
+      commitEra5Window(startIso, endIso);
+      updateEra5LineAnnotations(state.era5StartUtc, state.era5EndUtc);
       renderWaterLevelChart();
       syncSessionToEra5Window();
     });
   }
+
+  [era5StartInput, era5EndInput].forEach((inputEl) => {
+    if (!inputEl) return;
+    inputEl.addEventListener('input', updateEra5ApplyButtonDirtyState);
+    inputEl.addEventListener('change', updateEra5ApplyButtonDirtyState);
+  });
+
+  updateEra5ApplyButtonDirtyState();
 
   loadStormCatalog();
 })();
