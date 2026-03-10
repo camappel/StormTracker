@@ -541,11 +541,11 @@ def _parse_iso_utc(dt_str: str) -> datetime:
 @app.post("/api/storm/start-session")
 async def api_start_storm_session(body: StartStormSessionBody):
     """
-    Download (or reuse existing) ERA5 file for the given storm + time window
-    and create a StormTracker session bound to that storm_id.
+    Download ERA5 file for the given storm + time window and create a
+    StormTracker session bound to that storm_id.
 
     The ERA5 files are stored under the shared 2_DATA/4_ERA5_API directory so that
-    they are re-usable across the analysis notebook and this web app.
+    they remain available for the analysis notebook and this web app.
     """
     storm_id = int(body.storm_id)
     t_start = _parse_iso_utc(body.start_utc)
@@ -557,30 +557,59 @@ async def api_start_storm_session(body: StartStormSessionBody):
     era5_filename = f"ERA5_{storm_id}_{t_start:%Y%m%d}_{t_end:%Y%m%d}.nc"
     era5_path = ERA5_DIR / era5_filename
 
-    if not era5_path.exists():
-        try:
-            import cdsapi  # type: ignore
-        except ImportError:
-            raise HTTPException(
-                status_code=500,
-                detail="cdsapi is not installed on the server; cannot download ERA5 automatically.",
-            )
+    try:
+        import cdsapi  # type: ignore
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="cdsapi is not installed on the server; cannot download ERA5 automatically.",
+        )
 
-        start_date = t_start.date()
-        end_date = t_end.date()
-        same_day = start_date == end_date
-        if same_day:
-            hours_in_range = list(range(t_start.hour, t_end.hour + 1))
-        else:
-            hours_in_range = list(range(24))
-        if not hours_in_range:
-            raise HTTPException(status_code=400, detail="Invalid time range")
+    start_date = t_start.date()
+    end_date = t_end.date()
+    same_day = start_date == end_date
+    if same_day:
+        hours_in_range = list(range(t_start.hour, t_end.hour + 1))
+    else:
+        hours_in_range = list(range(24))
+    if not hours_in_range:
+        raise HTTPException(status_code=400, detail="Invalid time range")
 
-        ERA5_DIR.mkdir(parents=True, exist_ok=True)
-        client = cdsapi.Client()
+    ERA5_DIR.mkdir(parents=True, exist_ok=True)
+    era5_path.unlink(missing_ok=True)
+    client = cdsapi.Client()
 
-        if start_date.year == end_date.year and start_date.month == end_date.month:
-            days_in_range = list(range(start_date.day, end_date.day + 1))
+    if start_date.year == end_date.year and start_date.month == end_date.month:
+        days_in_range = list(range(start_date.day, end_date.day + 1))
+        request = {
+            "product_type": "reanalysis",
+            "variable": [
+                "mean_sea_level_pressure",
+                "10m_u_component_of_wind",
+                "10m_v_component_of_wind",
+            ],
+            "year": [f"{t_start.year:04d}"],
+            "month": [f"{t_start.month:02d}"],
+            "day": [f"{d:02d}" for d in days_in_range],
+            "time": [f"{h:02d}:00" for h in hours_in_range],
+            "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
+            "format": "netcdf",
+        }
+        client.retrieve("reanalysis-era5-single-levels", request).download(str(era5_path))
+    else:
+        paths_to_merge = []
+        cur = start_date
+        while cur <= end_date:
+            y, m = cur.year, cur.month
+            month_end = date(y, m + 1, 1) - timedelta(days=1) if m < 12 else date(y, 12, 31)
+            d_start = cur.day if (cur.year, cur.month) == (start_date.year, start_date.month) else 1
+            d_end = end_date.day if (end_date.year, end_date.month) == (y, m) else month_end.day
+            if cur == start_date and start_date != end_date:
+                use_hours = list(range(t_start.hour, 24))
+            elif (end_date.year, end_date.month, end_date.day) == (y, m, d_end) and start_date != end_date:
+                use_hours = list(range(0, t_end.hour + 1))
+            else:
+                use_hours = list(range(24))
             request = {
                 "product_type": "reanalysis",
                 "variable": [
@@ -588,56 +617,27 @@ async def api_start_storm_session(body: StartStormSessionBody):
                     "10m_u_component_of_wind",
                     "10m_v_component_of_wind",
                 ],
-                "year": [f"{t_start.year:04d}"],
-                "month": [f"{t_start.month:02d}"],
-                "day": [f"{d:02d}" for d in days_in_range],
-                "time": [f"{h:02d}:00" for h in hours_in_range],
+                "year": [f"{y:04d}"],
+                "month": [f"{m:02d}"],
+                "day": [f"{d:02d}" for d in range(d_start, d_end + 1)],
+                "time": [f"{h:02d}:00" for h in use_hours],
                 "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
                 "format": "netcdf",
             }
-            client.retrieve("reanalysis-era5-single-levels", request).download(str(era5_path))
+            part_path = ERA5_DIR / f"ERA5_{storm_id}_{y:04d}{m:02d}_part.nc"
+            client.retrieve("reanalysis-era5-single-levels", request).download(str(part_path))
+            paths_to_merge.append(part_path)
+            cur = month_end + timedelta(days=1)
+        if len(paths_to_merge) == 1:
+            paths_to_merge[0].rename(era5_path)
         else:
-            paths_to_merge = []
-            cur = start_date
-            while cur <= end_date:
-                y, m = cur.year, cur.month
-                month_end = date(y, m + 1, 1) - timedelta(days=1) if m < 12 else date(y, 12, 31)
-                d_start = cur.day if (cur.year, cur.month) == (start_date.year, start_date.month) else 1
-                d_end = end_date.day if (end_date.year, end_date.month) == (y, m) else month_end.day
-                if cur == start_date and start_date != end_date:
-                    use_hours = list(range(t_start.hour, 24))
-                elif (end_date.year, end_date.month, end_date.day) == (y, m, d_end) and start_date != end_date:
-                    use_hours = list(range(0, t_end.hour + 1))
-                else:
-                    use_hours = list(range(24))
-                request = {
-                    "product_type": "reanalysis",
-                    "variable": [
-                        "mean_sea_level_pressure",
-                        "10m_u_component_of_wind",
-                        "10m_v_component_of_wind",
-                    ],
-                    "year": [f"{y:04d}"],
-                    "month": [f"{m:02d}"],
-                    "day": [f"{d:02d}" for d in range(d_start, d_end + 1)],
-                    "time": [f"{h:02d}:00" for h in use_hours],
-                    "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
-                    "format": "netcdf",
-                }
-                part_path = ERA5_DIR / f"ERA5_{storm_id}_{y:04d}{m:02d}_part.nc"
-                client.retrieve("reanalysis-era5-single-levels", request).download(str(part_path))
-                paths_to_merge.append(part_path)
-                cur = month_end + timedelta(days=1)
-            if len(paths_to_merge) == 1:
-                paths_to_merge[0].rename(era5_path)
-            else:
-                ds_list = [xr.open_dataset(p) for p in paths_to_merge]
-                combined = xr.concat(sorted(ds_list, key=lambda d: d["valid_time"].values[0]), dim="valid_time")
-                for ds in ds_list:
-                    ds.close()
-                combined.to_netcdf(era5_path)
-                for p in paths_to_merge:
-                    p.unlink(missing_ok=True)
+            ds_list = [xr.open_dataset(p) for p in paths_to_merge]
+            combined = xr.concat(sorted(ds_list, key=lambda d: d["valid_time"].values[0]), dim="valid_time")
+            for ds in ds_list:
+                ds.close()
+            combined.to_netcdf(era5_path)
+            for p in paths_to_merge:
+                p.unlink(missing_ok=True)
 
     return _create_session_from_era5(era5_path, storm_id=storm_id)
 

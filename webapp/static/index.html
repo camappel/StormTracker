@@ -31,8 +31,27 @@
             <p id="water-level-error" class="error-message" hidden></p>
             <div id="era5-window-section" class="era5-window-section" hidden>
               <div class="era5-window-controls">
-                <button type="button" id="btn-era5-reset" class="button secondary-button">Reset ERA5 window</button>
-                <button type="button" id="btn-era5-update" class="button secondary-button">Update ERA5 window</button>
+                <div class="range-row">
+                  <div class="range-field">
+                    <label for="chart-range-start">Chart range start (UTC)</label>
+                    <select id="chart-range-start"></select>
+                  </div>
+                  <div class="range-field">
+                    <label for="chart-range-end">Chart range end (UTC)</label>
+                    <select id="chart-range-end"></select>
+                  </div>
+                </div>
+                <div class="range-row">
+                  <div class="range-field">
+                    <label for="era5-start-input">ERA5 start (UTC)</label>
+                    <input type="datetime-local" id="era5-start-input" step="3600">
+                  </div>
+                  <div class="range-field">
+                    <label for="era5-end-input">ERA5 end (UTC)</label>
+                    <input type="datetime-local" id="era5-end-input" step="3600">
+                  </div>
+                </div>
+                <button type="button" id="btn-era5-apply" class="button secondary-button">Apply ERA5 window</button>
               </div>
             </div>
             <div id="water-level-chart-wrap" class="chart-wrap" hidden>

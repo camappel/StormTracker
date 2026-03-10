@@ -26,8 +26,6 @@
     era5EndUtc: null,
     plotStartUtc: null,
     plotEndUtc: null,
-    candidateEra5StartUtc: null,
-    candidateEra5EndUtc: null,
     sliderInternalUpdate: false,
     autoStartTimer: null,
     lastAutoStartKey: null,
@@ -43,8 +41,11 @@
   const waterTideChartCanvas = document.getElementById('water-tide-chart');
   const surgeChartCanvas = document.getElementById('surge-chart');
   const era5WindowSection = document.getElementById('era5-window-section');
-  const btnEra5Reset = document.getElementById('btn-era5-reset');
-  const btnEra5Update = document.getElementById('btn-era5-update');
+  const chartRangeStartSelect = document.getElementById('chart-range-start');
+  const chartRangeEndSelect = document.getElementById('chart-range-end');
+  const era5StartInput = document.getElementById('era5-start-input');
+  const era5EndInput = document.getElementById('era5-end-input');
+  const btnEra5Apply = document.getElementById('btn-era5-apply');
   const activeFirstFrameEl = document.getElementById('active-first-frame');
   const activeCurrentFrameEl = document.getElementById('active-current-frame');
   const activeLastFrameEl = document.getElementById('active-last-frame');
@@ -120,41 +121,74 @@
     return t && t.time_utc ? t.time_utc.slice(5, 16).replace('T', ' ') : String(i + 1);
   }
 
-  function isoAtIndex(idx) {
-    const i = Math.max(0, Math.min(idx, state.times.length - 1));
-    const t = state.times[i];
-    return t && t.time_utc ? t.time_utc : null;
+  function isoToLocalInputValue(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(d.getUTCDate()).padStart(2, '0');
+    const h = String(d.getUTCHours()).padStart(2, '0');
+    return `${y}-${m}-${day}T${h}:00`;
   }
 
-  function setEra5UpdateButtonDirty(isDirty) {
-    if (!btnEra5Update) return;
-    btnEra5Update.disabled = !isDirty;
-    btnEra5Update.classList.toggle('primary-button', Boolean(isDirty));
-    btnEra5Update.classList.toggle('secondary-button', !isDirty);
+  function localInputValueToIso(value) {
+    if (!value) return null;
+    const d = new Date(`${value}:00Z`);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
   }
 
-  function refreshEra5CandidateFromSlider() {
-    state.candidateEra5StartUtc = isoAtIndex(state.activeStartIdx);
-    state.candidateEra5EndUtc = isoAtIndex(state.activeEndIdx);
-    const dirty = Boolean(
-      state.candidateEra5StartUtc &&
-      state.candidateEra5EndUtc &&
-      (state.candidateEra5StartUtc !== state.era5StartUtc || state.candidateEra5EndUtc !== state.era5EndUtc)
-    );
-    setEra5UpdateButtonDirty(dirty);
-  }
-
-  function updateChartViewport(minUtc, maxUtc) {
-    if (!minUtc || !maxUtc) return;
-    const charts = [state.waterTideChart, state.surgeChart];
-    charts.forEach((chart) => {
-      if (!chart) return;
-      if (chart.options.scales && chart.options.scales.x) {
-        chart.options.scales.x.min = minUtc;
-        chart.options.scales.x.max = maxUtc;
-        chart.update('none');
+  function nearestSeriesIso(targetIso, mode) {
+    if (!state.waterSeries.length) return null;
+    const targetMs = new Date(targetIso).getTime();
+    if (!Number.isFinite(targetMs)) return null;
+    if (mode === 'start') {
+      for (let i = 0; i < state.waterSeries.length; i++) {
+        const ms = new Date(state.waterSeries[i].time_utc).getTime();
+        if (Number.isFinite(ms) && ms >= targetMs) return state.waterSeries[i].time_utc;
       }
+      return state.waterSeries[state.waterSeries.length - 1].time_utc;
+    }
+    for (let i = state.waterSeries.length - 1; i >= 0; i--) {
+      const ms = new Date(state.waterSeries[i].time_utc).getTime();
+      if (Number.isFinite(ms) && ms <= targetMs) return state.waterSeries[i].time_utc;
+    }
+    return state.waterSeries[0].time_utc;
+  }
+
+  function populateChartRangeControls() {
+    if (!chartRangeStartSelect || !chartRangeEndSelect) return;
+    chartRangeStartSelect.innerHTML = '';
+    chartRangeEndSelect.innerHTML = '';
+    state.waterSeries.forEach((point) => {
+      if (!point.time_utc) return;
+      const label = formatIsoForCompactUtc(point.time_utc);
+      const startOpt = document.createElement('option');
+      startOpt.value = point.time_utc;
+      startOpt.textContent = label;
+      const endOpt = document.createElement('option');
+      endOpt.value = point.time_utc;
+      endOpt.textContent = label;
+      chartRangeStartSelect.appendChild(startOpt);
+      chartRangeEndSelect.appendChild(endOpt);
     });
+  }
+
+  function applyChartRange(startIso, endIso) {
+    if (!state.waterSeries.length) return;
+    let nextStart = nearestSeriesIso(startIso, 'start');
+    let nextEnd = nearestSeriesIso(endIso, 'end');
+    if (!nextStart || !nextEnd) return;
+    if (new Date(nextEnd) <= new Date(nextStart)) {
+      nextStart = state.waterSeries[0].time_utc;
+      nextEnd = state.waterSeries[state.waterSeries.length - 1].time_utc;
+    }
+    state.plotStartUtc = nextStart;
+    state.plotEndUtc = nextEnd;
+    if (chartRangeStartSelect) chartRangeStartSelect.value = nextStart;
+    if (chartRangeEndSelect) chartRangeEndSelect.value = nextEnd;
+    updateChartViewport(nextStart, nextEnd);
   }
 
   function updateEra5LineAnnotations(startIso, endIso) {
@@ -175,35 +209,19 @@
   }
 
   function lockOuterSliderHandles() {
-    if (!timeWindowSliderEl) return;
-    const origins = timeWindowSliderEl.querySelectorAll('.noUi-origin');
-    if (!origins || origins.length < 3) return;
-    const setHandleDisabled = function (originEl, disabled) {
-      originEl.style.pointerEvents = disabled ? 'none' : '';
-      const handle = originEl.querySelector('.noUi-handle');
-      if (handle) {
-        handle.setAttribute('aria-disabled', disabled ? 'true' : 'false');
-      }
-    };
-    setHandleDisabled(origins[0], true);
-    setHandleDisabled(origins[1], false);
-    setHandleDisabled(origins[2], true);
+    // Single-handle slider now controls only current frame.
   }
 
   function ensureWindowSlider() {
     if (!timeWindowSliderEl || typeof noUiSlider === 'undefined') return;
     if (timeWindowSliderEl.noUiSlider) return;
     noUiSlider.create(timeWindowSliderEl, {
-      start: [0, 0, 0],
-      connect: [false, true, true, false],
+      start: [0],
+      connect: [true, false],
       step: 1,
-      behaviour: 'drag',
+      behaviour: 'tap-drag',
       range: { min: 0, max: 1 },
-      tooltips: [
-        { to: (v) => sliderTooltipForIndex(Math.round(v)) },
-        { to: (v) => sliderTooltipForIndex(Math.round(v)) },
-        { to: (v) => sliderTooltipForIndex(Math.round(v)) }
-      ],
+      tooltips: [{ to: (v) => sliderTooltipForIndex(Math.round(v)) }],
       format: {
         to: (v) => String(Math.round(v)),
         from: (v) => Number(v)
@@ -213,7 +231,7 @@
     timeWindowSliderEl.noUiSlider.on('update', (values) => {
       if (state.sliderInternalUpdate || !state.times.length) return;
       const n = state.times.length;
-      let currentIdx = Math.round(Number(values[1]));
+      let currentIdx = Math.round(Number(values[0]));
       const startIdx = Math.max(0, Math.min(state.activeStartIdx, n - 1));
       const endIdx = Math.max(startIdx, Math.min(state.activeEndIdx, n - 1));
       if (currentIdx < startIdx) currentIdx = startIdx;
@@ -223,12 +241,8 @@
       updateFrameWindowStatus();
       updateCurrentFrameMarker();
       loadFrame();
-      const normalized = [startIdx, currentIdx, endIdx];
-      if (
-        Math.round(Number(values[0])) !== startIdx ||
-        currentIdx !== Math.round(Number(values[1])) ||
-        Math.round(Number(values[2])) !== endIdx
-      ) {
+      const normalized = [currentIdx];
+      if (currentIdx !== Math.round(Number(values[0]))) {
         state.sliderInternalUpdate = true;
         timeWindowSliderEl.noUiSlider.set(normalized);
         state.sliderInternalUpdate = false;
@@ -247,7 +261,7 @@
     const slider = timeWindowSliderEl.noUiSlider;
     state.sliderInternalUpdate = true;
     slider.updateOptions({ range: { min: 0, max: Math.max(1, n - 1) } }, false);
-    slider.set([minIdx, state.timeIndex, maxIdx]);
+    slider.set([state.timeIndex]);
     state.sliderInternalUpdate = false;
     lockOuterSliderHandles();
   }
@@ -406,6 +420,14 @@
     return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
   }
 
+  function formatIsoForCompactUtc(isoString) {
+    if (!isoString) return '—';
+    const d = new Date(isoString);
+    if (Number.isNaN(d.getTime())) return '—';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+  }
+
   function parseSessionUtc(value) {
     if (!value) return null;
     const s = String(value).trim().replace(' ', 'T');
@@ -451,32 +473,6 @@
     activeFrameCountEl.textContent = String(endIdx - startIdx + 1);
   }
 
-  function setActiveWindowIndices(startIdx, endIdx, opts) {
-    const n = state.times.length;
-    if (n === 0) return false;
-    const minSpan = 2;
-    const nextStart = Math.max(0, Math.min(startIdx, n - 1));
-    const nextEnd = Math.max(nextStart, Math.min(endIdx, n - 1));
-    if (nextEnd - nextStart + 1 < minSpan) {
-      showError(`Window must keep at least ${minSpan} frames.`);
-      return false;
-    }
-    state.activeStartIdx = nextStart;
-    state.activeEndIdx = nextEnd;
-    if (state.timeIndex < nextStart) state.timeIndex = nextStart;
-    if (state.timeIndex > nextEnd) state.timeIndex = nextEnd;
-    updateSlider();
-    refreshEra5CandidateFromSlider();
-    updateEra5LineAnnotations(state.candidateEra5StartUtc, state.candidateEra5EndUtc);
-    updateTimeLabel();
-    updateFrameWindowStatus();
-    updateCurrentFrameMarker();
-    if (!opts || opts.reloadFrame !== false) {
-      loadFrame();
-    }
-    return true;
-  }
-
   function nearestStartIndexForTimeMs(targetMs) {
     const n = state.times.length;
     for (let i = 0; i < n; i++) {
@@ -511,40 +507,20 @@
   }
 
   function setEra5Window(startIso, endIso) {
-    startUtcInput.value = startIso || '';
-    endUtcInput.value = endIso || '';
-    state.candidateEra5StartUtc = startIso || null;
-    state.candidateEra5EndUtc = endIso || null;
+    const nextStart = startIso || '';
+    const nextEnd = endIso || '';
+    startUtcInput.value = nextStart;
+    endUtcInput.value = nextEnd;
+    if (era5StartInput) era5StartInput.value = isoToLocalInputValue(nextStart);
+    if (era5EndInput) era5EndInput.value = isoToLocalInputValue(nextEnd);
   }
 
   function syncSessionToEra5Window() {
     const startIso = startUtcInput.value;
     const endIso = endUtcInput.value;
     if (!startIso || !endIso) return;
-    if (!state.sessionId || !state.times.length) {
-      startStormSessionAutomatically(true);
-      return;
-    }
-    const sessionStartMs = sessionIndexTimeMs(0);
-    const sessionEndMs = sessionIndexTimeMs(state.times.length - 1);
-    const targetStartMs = new Date(startIso).getTime();
-    const targetEndMs = new Date(endIso).getTime();
-    const insideSession = targetStartMs >= sessionStartMs && targetEndMs <= sessionEndMs;
-    if (!insideSession) {
-      showApiStatus('Updating selected range: downloading ERA5 data…');
-      startStormSessionAutomatically(true);
-      return;
-    }
-    const startIdx = nearestStartIndexForTimeMs(targetStartMs);
-    const endIdx = nearestEndIndexForTimeMs(targetEndMs);
-    setActiveWindowIndices(startIdx, endIdx, { reloadFrame: false });
-    if (state.timeIndex < state.activeStartIdx) state.timeIndex = state.activeStartIdx;
-    if (state.timeIndex > state.activeEndIdx) state.timeIndex = state.activeEndIdx;
-    updateSlider();
-    updateTimeLabel();
-    updateFrameWindowStatus();
-    updateCurrentFrameMarker();
-    loadFrame();
+    showApiStatus('Updating ERA5 window: downloading data…');
+    startStormSessionAutomatically(true);
   }
 
   function computeDefaultWindows(series) {
@@ -787,8 +763,8 @@
         }
       };
     };
-    const era5Start = state.candidateEra5StartUtc || state.era5StartUtc || startIso;
-    const era5End = state.candidateEra5EndUtc || state.era5EndUtc || endIso;
+    const era5Start = state.era5StartUtc || startIso;
+    const era5End = state.era5EndUtc || endIso;
     addLine(waterAnnotations, 'era5-start-line', era5Start, 'rgba(0, 120, 200, 0.9)', 'ERA5 Start', false);
     addLine(waterAnnotations, 'era5-end-line', era5End, 'rgba(0, 120, 200, 0.9)', 'ERA5 End', false);
     stormWindows.forEach(function (win, i) {
@@ -833,8 +809,8 @@
         labels,
         datasets: [
           { label: 'Water level (m)', data: wlData, borderColor: '#1e88e5', backgroundColor: 'rgba(30, 136, 229, 0.1)', fill: false, tension: 0.1, pointRadius: 0 },
-          { label: 'Predicted tide (m)', data: tideData, borderColor: '#e53935', backgroundColor: 'rgba(229, 57, 53, 0.08)', fill: false, tension: 0.1, pointRadius: 0 },
-          { label: 'Surge (m)', data: surgeData, borderColor: '#ff6728', backgroundColor: 'rgba(255, 103, 40, 0.1)', fill: false, tension: 0.1, pointRadius: 0, hidden: true }
+          { label: 'Predicted tide (m)', data: tideData, borderColor: '#e53935', backgroundColor: 'rgba(229, 57, 53, 0.08)', fill: false, tension: 0.1, pointRadius: 0, hidden: true },
+          { label: 'Surge (m)', data: surgeData, borderColor: '#ff6728', backgroundColor: 'rgba(255, 103, 40, 0.1)', fill: false, tension: 0.1, pointRadius: 0 }
         ]
       },
       options: {
@@ -899,24 +875,6 @@
     state.activeStartIdx = 0;
     state.activeEndIdx = Math.max(0, state.times.length - 1);
     state.timeIndex = state.activeStartIdx;
-    // Set ERA5 window (slider outer handles) from 24h before/after barrier when available.
-    const era5StartMs = state.era5StartUtc ? new Date(state.era5StartUtc).getTime() : NaN;
-    const era5EndMs = state.era5EndUtc ? new Date(state.era5EndUtc).getTime() : NaN;
-    if (Number.isFinite(era5StartMs) && Number.isFinite(era5EndMs)) {
-      const sessionStartIdx = nearestStartIndexForTimeMs(era5StartMs);
-      const sessionEndIdx = nearestEndIndexForTimeMs(era5EndMs);
-      state.activeStartIdx = Math.max(0, Math.min(sessionStartIdx, state.times.length - 1));
-      state.activeEndIdx = Math.max(state.activeStartIdx, Math.min(sessionEndIdx, state.times.length - 1));
-    } else {
-      const startMs = startUtcInput.value ? new Date(startUtcInput.value).getTime() : NaN;
-      const endMs = endUtcInput.value ? new Date(endUtcInput.value).getTime() : NaN;
-      if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
-        const sessionStartIdx = nearestStartIndexForTimeMs(startMs);
-        const sessionEndIdx = nearestEndIndexForTimeMs(endMs);
-        state.activeStartIdx = Math.max(0, Math.min(sessionStartIdx, state.times.length - 1));
-        state.activeEndIdx = Math.max(state.activeStartIdx, Math.min(sessionEndIdx, state.times.length - 1));
-      }
-    }
     const currentAnchorIso = state.barrierEndUtc || state.defaultCurrentUtc;
     const currentMs = currentAnchorIso ? new Date(currentAnchorIso).getTime() : NaN;
     if (Number.isFinite(currentMs)) {
@@ -930,10 +888,6 @@
     } else {
       state.timeIndex = state.activeStartIdx;
     }
-    // Keep first-load state exactly aligned with committed ERA5 defaults.
-    state.candidateEra5StartUtc = state.era5StartUtc;
-    state.candidateEra5EndUtc = state.era5EndUtc;
-    setEra5UpdateButtonDirty(false);
     state.track = [];
     mapSection.hidden = false;
     if (gifSection) {
@@ -941,7 +895,6 @@
     }
     clearGifPreview();
     updateSlider();
-    refreshEra5CandidateFromSlider();
     updateTimeLabel();
     updateFrameWindowStatus();
     updateCurrentFrameMarker();
@@ -1019,11 +972,12 @@
     state.stormWindows = [];
     state.era5StartUtc = null;
     state.era5EndUtc = null;
-    state.candidateEra5StartUtc = null;
-    state.candidateEra5EndUtc = null;
     startUtcInput.value = '';
     endUtcInput.value = '';
-    setEra5UpdateButtonDirty(false);
+    if (era5StartInput) era5StartInput.value = '';
+    if (era5EndInput) era5EndInput.value = '';
+    if (chartRangeStartSelect) chartRangeStartSelect.innerHTML = '';
+    if (chartRangeEndSelect) chartRangeEndSelect.innerHTML = '';
     if (activeFirstFrameEl) activeFirstFrameEl.textContent = '—';
     if (activeCurrentFrameEl) activeCurrentFrameEl.textContent = '—';
     if (activeLastFrameEl) activeLastFrameEl.textContent = '—';
@@ -1074,21 +1028,21 @@
         }
         const defaults = computeDefaultWindows(series);
         if (defaults) {
-          state.plotStartUtc = defaults.mainStartUtc;
-          state.plotEndUtc = defaults.mainEndUtc;
           // ERA5 window defaults to 24h before/after barrier.
           state.era5StartUtc = defaults.era5StartUtc;
           state.era5EndUtc = defaults.era5EndUtc;
           setEra5Window(defaults.era5StartUtc, defaults.era5EndUtc);
-          state.candidateEra5StartUtc = defaults.era5StartUtc;
-          state.candidateEra5EndUtc = defaults.era5EndUtc;
-          setEra5UpdateButtonDirty(false);
-          updateChartViewport(state.plotStartUtc, state.plotEndUtc);
+          populateChartRangeControls();
+          applyChartRange(defaults.mainStartUtc, defaults.mainEndUtc);
         } else {
           setEra5Window('', '');
-          setEra5UpdateButtonDirty(false);
+          populateChartRangeControls();
+          if (series.length) {
+            applyChartRange(series[0].time_utc, series[series.length - 1].time_utc);
+          }
         }
         renderWaterLevelChart();
+        updateEra5LineAnnotations(state.era5StartUtc, state.era5EndUtc);
         queueAutoStartSession(true);
       })
       .catch(function (e) {
@@ -1153,41 +1107,43 @@
     }
   });
 
-  if (btnEra5Reset) {
-    btnEra5Reset.addEventListener('click', () => {
-      if (!state.waterSeries.length) return;
-      const defaults = computeDefaultWindows(state.waterSeries);
-      if (!defaults) return;
-      state.era5StartUtc = defaults.era5StartUtc;
-      state.era5EndUtc = defaults.era5EndUtc;
-      setEra5Window(defaults.era5StartUtc, defaults.era5EndUtc);
-      if (state.times.length) {
-        const startIdx = nearestStartIndexForTimeMs(new Date(defaults.era5StartUtc).getTime());
-        const endIdx = nearestEndIndexForTimeMs(new Date(defaults.era5EndUtc).getTime());
-        setActiveWindowIndices(startIdx, endIdx, { reloadFrame: false });
-      } else {
-        updateChartViewport(defaults.mainStartUtc, defaults.mainEndUtc);
-      }
-      setEra5UpdateButtonDirty(false);
+  if (chartRangeStartSelect) {
+    chartRangeStartSelect.addEventListener('change', () => {
+      if (!chartRangeStartSelect.value || !chartRangeEndSelect || !chartRangeEndSelect.value) return;
+      applyChartRange(chartRangeStartSelect.value, chartRangeEndSelect.value);
       renderWaterLevelChart();
-      syncSessionToEra5Window();
     });
   }
-  if (btnEra5Update) {
-    btnEra5Update.addEventListener('click', () => {
-      if (btnEra5Update.disabled) return;
-      const startIso = state.candidateEra5StartUtc || state.era5StartUtc;
-      const endIso = state.candidateEra5EndUtc || state.era5EndUtc;
-      if (!startIso || !endIso) return;
+
+  if (chartRangeEndSelect) {
+    chartRangeEndSelect.addEventListener('change', () => {
+      if (!chartRangeEndSelect.value || !chartRangeStartSelect || !chartRangeStartSelect.value) return;
+      applyChartRange(chartRangeStartSelect.value, chartRangeEndSelect.value);
+      renderWaterLevelChart();
+    });
+  }
+
+  if (btnEra5Apply) {
+    btnEra5Apply.addEventListener('click', () => {
+      const startIso = localInputValueToIso(era5StartInput ? era5StartInput.value : '');
+      const endIso = localInputValueToIso(era5EndInput ? era5EndInput.value : '');
+      if (!startIso || !endIso) {
+        showError('Please set both ERA5 start and end times.');
+        return;
+      }
+      if (new Date(endIso) <= new Date(startIso)) {
+        showError('ERA5 end time must be after start time.');
+        return;
+      }
+      clearError();
       state.era5StartUtc = startIso;
       state.era5EndUtc = endIso;
       setEra5Window(startIso, endIso);
-      setEra5UpdateButtonDirty(false);
+      updateEra5LineAnnotations(startIso, endIso);
       renderWaterLevelChart();
       syncSessionToEra5Window();
     });
   }
 
-  setEra5UpdateButtonDirty(false);
   loadStormCatalog();
 })();

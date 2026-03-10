@@ -274,22 +274,38 @@ header h1 {
 
 .era5-window-controls {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  align-items: flex-end;
+  flex-direction: column;
+  gap: 0.5rem;
   margin-top: 0.5rem;
 }
 
-.era5-window-controls label {
+.range-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 0.6rem 0.75rem;
+}
+
+.range-field {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
-  font-size: 0.85rem;
 }
 
-.era5-window-controls input[type="number"] {
-  width: 120px;
+.range-field label {
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.era5-window-controls input[type="datetime-local"],
+.era5-window-controls select {
+  width: 100%;
   padding: 0.25rem 0.4rem;
+  font-size: 0.9rem;
+}
+
+#btn-era5-apply {
+  align-self: flex-start;
+  margin-top: 0.25rem;
 }
 
 .mode-controls label {
