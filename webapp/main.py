@@ -3,22 +3,26 @@ StormTracker ERA5 Web App — FastAPI backend.
 Upload ERA5 NetCDF, step through time, draw storm track by clicking, download CSV.
 """
 import io
+import os
 import tempfile
 import time
 import uuid
+import warnings
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from scipy.interpolate import RegularGridInterpolator
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -28,10 +32,19 @@ XB_MET = [-30, 15]
 YB_MET = [40, 70]
 INT_SKIP = 3
 VMIN, VMAX = 967, 1020
-STORM_ID_DEFAULT = 1
 
 # Session TTL (seconds); optional cleanup not implemented in MVP
 SESSION_TTL = 3600
+
+# Paths to analysis outputs (mast1.pkl, water level plots, ERA5 files)
+ROOT_DIR = Path(__file__).resolve().parents[2]
+ANALYSIS_DIR = ROOT_DIR / "Objective1" / "3a_ANALYSIS_Python"
+ANALYSIS_OUTPUT_DIR = ANALYSIS_DIR / "output"
+MAST1_PATH = ANALYSIS_OUTPUT_DIR / "mast1.pkl"
+WATER_LEVEL_DIR = ANALYSIS_OUTPUT_DIR / "water_level_plots"
+ERA5_DIR = ROOT_DIR / "2_DATA" / "4_ERA5_API"
+
+COMBINED_TRACKS_PATH = ANALYSIS_OUTPUT_DIR / "storm_tracks_labeled_web.csv"
 
 app = FastAPI(title="StormTracker ERA5 Web App")
 app.add_middleware(
@@ -42,11 +55,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# session_id -> { path, LON, LAT, P_MET, U_MET, V_MET, ts_valid, frame_list, track, last_access }
+# session_id -> { path, storm_id, LON, LAT, P_MET, U_MET, V_MET, ts_valid, frame_list, track, last_access }
 sessions: dict = {}
 # Temp directory for uploads
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "stormtracker_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_mast1():
+    if not MAST1_PATH.exists():
+        raise HTTPException(status_code=500, detail=f"mast1.pkl not found at {MAST1_PATH}")
+    data = pd.read_pickle(MAST1_PATH)
+    if "storm_df" not in data:
+        raise HTTPException(status_code=500, detail="mast1.pkl missing 'storm_df'")
+    return data["storm_df"]
+
+
+def _get_storm_catalog():
+    storm_df = _load_mast1()
+    storm_ids = sorted(storm_df["Storm"].unique())
+    rows = []
+    for sid in storm_ids:
+        group = storm_df[storm_df["Storm"] == sid]
+        storm_start = group["Start of Closure"].min()
+        storm_end = group["End of Closure"].fillna(
+            group["Start of Closure"] + pd.Timedelta(days=1)
+        ).max()
+        start_utc = storm_start.tz_localize("Europe/Amsterdam", ambiguous=False).tz_convert("UTC")
+        end_utc = storm_end.tz_localize("Europe/Amsterdam", ambiguous=False).tz_convert("UTC")
+        default_start = (start_utc - pd.Timedelta(hours=24)).strftime("%Y-%m-%dT%H:00:00Z")
+        default_end = (end_utc + pd.Timedelta(hours=24)).strftime("%Y-%m-%dT%H:00:00Z")
+        wl_path = WATER_LEVEL_DIR / f"water_level_storm_{sid}.png"
+        rows.append(
+            {
+                "storm_id": int(sid),
+                "label": f"Storm {sid}",
+                "storm_start_local": storm_start.strftime("%Y-%m-%d %H:%M"),
+                "storm_end_local": storm_end.strftime("%Y-%m-%d %H:%M"),
+                "default_start_utc": default_start,
+                "default_end_utc": default_end,
+                "has_water_level_plot": wl_path.exists(),
+            }
+        )
+    return rows
+
+
+@app.get("/api/storms")
+async def api_storms():
+    """
+    Return storm catalog with suggested ERA5 download windows and
+    whether a pre-generated water level plot exists.
+    """
+    return {"storms": _get_storm_catalog()}
+
+
+@app.get("/api/storms/{storm_id}/water_level")
+async def api_storm_water_level(storm_id: int):
+    """
+    Serve the pre-generated water level plot PNG for a storm.
+    """
+    path = WATER_LEVEL_DIR / f"water_level_storm_{storm_id}.png"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Water level plot not found for this storm")
+    return FileResponse(path, media_type="image/png")
 
 
 class TrackAddBody(BaseModel):
@@ -137,8 +208,10 @@ def parse_era5(path: Path) -> dict:
 
 
 def add_map_base(ax, xlim, ylim):
-    ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="white")
-    ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="lightgray", alpha=0.3)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="facecolor will have no effect", module="cartopy")
+        ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="white")
+        ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="lightgray", alpha=0.3)
     ax.add_feature(cfeature.COASTLINE.with_scale("50m"), linewidth=0.8, color="white")
     ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.5, color="white")
     ax.set_xlim(xlim)
@@ -231,9 +304,9 @@ def render_frame(session: dict, time_index: int, track: list) -> bytes:
         )
     ts_str = pd.Timestamp(grid_time).strftime("%Y-%m-%d %H:%M UTC")
     ax.set_title(f"StormTracker — {ts_str} (step {time_index + 1}/{len(frame_list)})", fontsize=12)
-    plt.tight_layout()
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.93)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=100, bbox_inches=None, pad_inches=0)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -271,6 +344,99 @@ def get_session(session_id: str):
     return sessions[session_id]
 
 
+def _create_session_from_era5(path: Path, storm_id: int | None = None) -> dict:
+    data = parse_era5(path)
+    session_id = uuid.uuid4().hex
+    sessions[session_id] = {
+        "path": path,
+        "storm_id": int(storm_id) if storm_id is not None else None,
+        **data,
+        "track": [],
+        "last_access": time.time(),
+    }
+    frame_list = data["frame_list"]
+    times = [
+        {"index": i, "time_utc": pd.Timestamp(t).strftime("%Y-%m-%d %H:%M:%S")}
+        for i, t in frame_list
+    ]
+    return {
+        "session_id": session_id,
+        "times": times,
+        "bounds": {
+            "lon_min": XB_MET[0],
+            "lon_max": XB_MET[1],
+            "lat_min": YB_MET[0],
+            "lat_max": YB_MET[1],
+        },
+    }
+
+
+class StartStormSessionBody(BaseModel):
+    storm_id: int
+    start_utc: str
+    end_utc: str
+
+
+def _parse_iso_utc(dt_str: str) -> datetime:
+    try:
+        # Accept with or without trailing 'Z'
+        s = dt_str.strip()
+        if s.endswith("Z"):
+            s = s[:-1]
+        return datetime.fromisoformat(s)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid datetime format: {dt_str!r}")
+
+
+@app.post("/api/storm/start-session")
+async def api_start_storm_session(body: StartStormSessionBody):
+    """
+    Download (or reuse existing) ERA5 file for the given storm + time window
+    and create a StormTracker session bound to that storm_id.
+
+    The ERA5 files are stored under the shared 2_DATA/4_ERA5_API directory so that
+    they are re-usable across the analysis notebook and this web app.
+    """
+    storm_id = int(body.storm_id)
+    t_start = _parse_iso_utc(body.start_utc)
+    t_end = _parse_iso_utc(body.end_utc)
+    if t_end <= t_start:
+        raise HTTPException(status_code=400, detail="end_utc must be after start_utc")
+
+    # Filenames match the convention used in storm.qmd helper
+    era5_filename = f"ERA5_{storm_id}_{t_start:%Y%m%d}_{t_end:%Y%m%d}.nc"
+    era5_path = ERA5_DIR / era5_filename
+
+    if not era5_path.exists():
+        try:
+            import cdsapi  # type: ignore
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="cdsapi is not installed on the server; cannot download ERA5 automatically.",
+            )
+
+        client = cdsapi.Client()
+        request = {
+            "product_type": "reanalysis",
+            "variable": [
+                "mean_sea_level_pressure",
+                "10m_u_component_of_wind",
+                "10m_v_component_of_wind",
+            ],
+            "year": [f"{t_start.year:04d}"],
+            "month": [f"{t_start.month:02d}"],
+            "day": [f"{d:02d}" for d in range(1, 32)],
+            "time": [f"{h:02d}:00" for h in range(24)],
+            "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
+            "format": "netcdf",
+        }
+        ERA5_DIR.mkdir(parents=True, exist_ok=True)
+        client.retrieve("reanalysis-era5-single-levels", request).download(str(era5_path))
+
+    return _create_session_from_era5(era5_path, storm_id=storm_id)
+
+
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".nc"):
@@ -279,29 +445,10 @@ async def api_upload(file: UploadFile = File(...)):
     path = UPLOAD_DIR / f"{uuid.uuid4().hex}.nc"
     path.write_bytes(contents)
     try:
-        data = parse_era5(path)
+        return _create_session_from_era5(path, storm_id=None)
     except HTTPException:
         path.unlink(missing_ok=True)
         raise
-    session_id = uuid.uuid4().hex
-    sessions[session_id] = {
-        "path": path,
-        **data,
-        "track": [],
-        "last_access": time.time(),
-    }
-    frame_list = data["frame_list"]
-    times = [{"index": i, "time_utc": pd.Timestamp(t).strftime("%Y-%m-%d %H:%M:%S")} for i, t in frame_list]
-    return {
-        "session_id": session_id,
-        "times": times,
-        "bounds": {
-            "lon_min": data["lon_min"],
-            "lon_max": data["lon_max"],
-            "lat_min": data["lat_min"],
-            "lat_max": data["lat_max"],
-        },
-    }
 
 
 @app.get("/api/frame/{session_id}/{time_index}")
@@ -374,18 +521,76 @@ async def api_csv(session_id: str):
     session = get_session(session_id)
     session["last_access"] = time.time()
     track = session["track"]
+    storm_id = session.get("storm_id")
     if not track:
         csv_content = "storm_id,time_utc,lon,lat,pressure_hpa\n"
     else:
         df = pd.DataFrame(track)
         df = df.rename(columns={"pressure_hpa": "pressure_hpa"})
-        df.insert(0, "storm_id", STORM_ID_DEFAULT)
+        df.insert(0, "storm_id", int(storm_id) if storm_id is not None else "")
         df = df[["storm_id", "time_utc", "lon", "lat", "pressure_hpa"]]
         csv_content = df.to_csv(index=False)
     return StreamingResponse(
         io.BytesIO(csv_content.encode("utf-8")),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=storm_track.csv"},
+    )
+
+
+@app.post("/api/combined/save/{session_id}")
+async def api_combined_save(session_id: str):
+    """
+    Append this session's track to the combined labeled CSV, keyed by (storm_id, time_utc).
+    Existing rows for those keys are replaced.
+    """
+    session = get_session(session_id)
+    session["last_access"] = time.time()
+    storm_id = session.get("storm_id")
+    if storm_id is None:
+        raise HTTPException(status_code=400, detail="Session is not associated with a storm_id")
+    track = session.get("track") or []
+    if not track:
+        raise HTTPException(status_code=400, detail="Track is empty; nothing to save")
+
+    new_df = pd.DataFrame(track)
+    new_df["storm_id"] = int(storm_id)
+    new_df = new_df[["storm_id", "time_utc", "lon", "lat", "pressure_hpa"]]
+    new_df["time_utc"] = pd.to_datetime(new_df["time_utc"])
+
+    if COMBINED_TRACKS_PATH.exists():
+        existing = pd.read_csv(COMBINED_TRACKS_PATH)
+        if not existing.empty:
+            existing["time_utc"] = pd.to_datetime(existing["time_utc"])
+            mask = existing["storm_id"] == int(storm_id)
+            existing = existing[~mask]
+            combined = pd.concat([existing, new_df], ignore_index=True)
+        else:
+            combined = new_df
+    else:
+        COMBINED_TRACKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        combined = new_df
+
+    combined.sort_values(["storm_id", "time_utc"], inplace=True)
+    combined.to_csv(COMBINED_TRACKS_PATH, index=False)
+    return {"rows": len(new_df)}
+
+
+@app.get("/api/combined/csv")
+async def api_combined_csv():
+    """
+    Download the combined CSV with all saved storm tracks.
+    """
+    if not COMBINED_TRACKS_PATH.exists():
+        csv_content = "storm_id,time_utc,lon,lat,pressure_hpa\n"
+        return StreamingResponse(
+            io.BytesIO(csv_content.encode("utf-8")),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=storm_tracks_labeled_web.csv"},
+        )
+    return FileResponse(
+        COMBINED_TRACKS_PATH,
+        media_type="text/csv",
+        filename="storm_tracks_labeled_web.csv",
     )
 
 

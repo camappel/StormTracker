@@ -25,6 +25,82 @@ header h1 {
   font-size: 0.95rem;
 }
 
+.storm-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: flex-start;
+}
+
+.panel-title {
+  margin: 0 0 0.5rem 0;
+  font-size: 1rem;
+}
+
+.storm-list-panel,
+.storm-detail-panel {
+  background: #fff;
+  border-radius: 8px;
+  padding: 0.75rem 1rem 1rem 1rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+#storm-select {
+  width: 100%;
+  padding: 0.3rem 0.4rem;
+  font-size: 0.95rem;
+}
+
+.storm-meta {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: #444;
+}
+
+.storm-meta strong {
+  font-weight: 600;
+}
+
+.water-level-container {
+  margin-bottom: 0.75rem;
+}
+
+.water-level-container img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 4px;
+}
+
+.placeholder {
+  margin: 0.5rem 0;
+  font-size: 0.9rem;
+  color: #666;
+}
+
+.era5-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  align-items: flex-end;
+}
+
+.field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.field-row label {
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.field-row input[type="datetime-local"] {
+  padding: 0.25rem 0.4rem;
+  font-size: 0.9rem;
+}
+
 .upload-zone {
   display: block;
   border: 2px dashed #999;
@@ -53,6 +129,12 @@ header h1 {
 .error {
   color: #c00;
   margin-top: 0.5rem;
+}
+
+.api-status {
+  color: #066;
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
 }
 
 #map-section {
@@ -137,10 +219,28 @@ header h1 {
   color: #fff;
   text-decoration: none;
   border-radius: 4px;
+  border: none;
+  cursor: pointer;
 }
 
 .button:hover {
   background: #085;
+}
+
+.primary-button {
+  background: #0a6;
+}
+
+.primary-button:hover {
+  background: #085;
+}
+
+.secondary-button {
+  background: #555;
+}
+
+.secondary-button:hover {
+  background: #333;
 }
 
 .map-container {

@@ -10,15 +10,39 @@
   <div id="app">
     <header>
       <h1>StormTracker ERA5</h1>
-      <p class="subtitle">Upload ERA5 NetCDF, step through time, click to draw storm track, download CSV.</p>
+      <p class="subtitle">Select a storm, inspect water levels, choose ERA5 dates, then click to draw the track.</p>
     </header>
 
-    <section id="upload-section">
-      <label class="upload-zone" id="upload-zone">
-        <input type="file" id="file-input" accept=".nc" hidden>
-        <span id="upload-text">Drop ERA5 .nc file here or click to choose</span>
-      </label>
-      <p id="upload-error" class="error" hidden></p>
+    <section id="storm-section">
+      <div class="storm-layout">
+        <div class="storm-list-panel">
+          <h2 class="panel-title">1. Choose storm</h2>
+          <select id="storm-select"></select>
+          <div id="storm-meta" class="storm-meta"></div>
+        </div>
+        <div class="storm-detail-panel">
+          <h2 class="panel-title">2. Water levels & dates</h2>
+          <div id="water-level-container" class="water-level-container">
+            <p id="water-level-placeholder" class="placeholder">Select a storm to load its water level plot.</p>
+            <img id="water-level-img" alt="Water level and surge" hidden />
+          </div>
+          <form id="era5-form" class="era5-form">
+            <div class="field-row">
+              <label for="start-utc">Start (UTC)</label>
+              <input type="datetime-local" id="start-utc">
+            </div>
+            <div class="field-row">
+              <label for="end-utc">End (UTC)</label>
+              <input type="datetime-local" id="end-utc">
+            </div>
+            <button type="submit" id="btn-start-storm" class="button primary-button">3. Download ERA5 &amp; start labeling</button>
+            <button type="button" id="btn-upload-nc" class="button secondary-button">Or upload existing ERA5 .nc</button>
+            <input type="file" id="file-input" accept=".nc" hidden>
+          </form>
+          <p id="api-status" class="api-status" hidden></p>
+          <p id="upload-error" class="error" hidden></p>
+        </div>
+      </div>
     </section>
 
     <section id="map-section" hidden>
@@ -31,7 +55,9 @@
           <label><input type="radio" name="mode" value="delete"> Delete point</label>
         </div>
         <div class="actions">
-          <a id="btn-download" href="#" download="storm_track.csv" class="button" style="visibility: hidden;">Download CSV</a>
+          <a id="btn-download" href="#" download="storm_track.csv" class="button" style="visibility: hidden;">Download CSV (this session)</a>
+          <button type="button" id="btn-save-combined" class="button secondary-button" disabled>Save storm to combined CSV</button>
+          <a id="btn-download-combined" href="/api/combined/csv" class="button" target="_blank">Download combined CSV</a>
         </div>
       </div>
       <div class="map-container">

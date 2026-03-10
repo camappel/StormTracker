@@ -6,13 +6,23 @@
     times: [],
     timeIndex: 0,
     track: [],
-    mode: 'add'
+    mode: 'add',
+    storms: [],
+    selectedStormId: null
   };
 
-  const uploadZone = document.getElementById('upload-zone');
+  const stormSelect = document.getElementById('storm-select');
+  const stormMeta = document.getElementById('storm-meta');
+  const waterLevelImg = document.getElementById('water-level-img');
+  const waterLevelPlaceholder = document.getElementById('water-level-placeholder');
+  const era5Form = document.getElementById('era5-form');
+  const startUtcInput = document.getElementById('start-utc');
+  const endUtcInput = document.getElementById('end-utc');
+  const btnStartStorm = document.getElementById('btn-start-storm');
+  const btnUploadNc = document.getElementById('btn-upload-nc');
   const fileInput = document.getElementById('file-input');
   const uploadError = document.getElementById('upload-error');
-  const uploadSection = document.getElementById('upload-section');
+  const apiStatus = document.getElementById('api-status');
   const mapSection = document.getElementById('map-section');
   const frameImg = document.getElementById('frame-img');
   const clickLayer = document.getElementById('click-layer');
@@ -21,6 +31,8 @@
   const btnPrev = document.getElementById('btn-prev');
   const btnNext = document.getElementById('btn-next');
   const btnDownload = document.getElementById('btn-download');
+  const btnSaveCombined = document.getElementById('btn-save-combined');
+  const btnDownloadCombined = document.getElementById('btn-download-combined');
   const trackInfo = document.getElementById('track-info');
 
   function showError(msg) {
@@ -31,6 +43,20 @@
   function clearError() {
     uploadError.textContent = '';
     uploadError.hidden = true;
+  }
+
+  function showApiStatus(msg) {
+    if (apiStatus) {
+      apiStatus.textContent = msg;
+      apiStatus.hidden = false;
+    }
+  }
+
+  function clearApiStatus() {
+    if (apiStatus) {
+      apiStatus.textContent = '';
+      apiStatus.hidden = true;
+    }
   }
 
   function pixelToLonLat(x, y) {
@@ -67,7 +93,8 @@
     const n = state.track.length;
     trackInfo.textContent = n === 0
       ? 'No track points. Click on map in "Add point" mode to add.'
-      : `${n} track point(s). Download CSV when done.`;
+      : `${n} track point(s). Save to combined CSV when done.`;
+    btnSaveCombined.disabled = !state.sessionId || n === 0;
   }
 
   function updateDownloadLink() {
@@ -154,19 +181,6 @@
     loadFrame();
   }
 
-  uploadZone.addEventListener('click', () => fileInput.click());
-  uploadZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    uploadZone.classList.add('dragover');
-  });
-  uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
-  uploadZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    uploadZone.classList.remove('dragover');
-    const file = e.dataTransfer.files[0];
-    if (file && file.name.toLowerCase().endsWith('.nc')) handleFile(file);
-    else showError('Please drop a .nc file.');
-  });
   fileInput.addEventListener('change', () => {
     const file = fileInput.files[0];
     if (file) handleFile(file);
@@ -186,21 +200,91 @@
         showError(data.detail || 'Upload failed');
         return;
       }
-      state.sessionId = data.session_id;
-      state.times = data.times || [];
-      state.bounds = data.bounds || {};
-      state.timeIndex = 0;
-      state.track = [];
-      uploadSection.hidden = true;
-      mapSection.hidden = false;
-      updateSlider();
-      updateTimeLabel();
-      updateTrackInfo();
-      updateDownloadLink();
-      loadFrame();
-      await fetchTrack();
+      startTrackingSession(data);
     } catch (e) {
       showError('Network error: ' + e.message);
+    }
+  }
+
+  function isoToLocalDatetimeValue(isoString) {
+    if (!isoString) return '';
+    const d = new Date(isoString);
+    const pad = (n) => String(n).padStart(2, '0');
+    const yyyy = d.getUTCFullYear();
+    const mm = pad(d.getUTCMonth() + 1);
+    const dd = pad(d.getUTCDate());
+    const hh = pad(d.getUTCHours());
+    const min = pad(d.getUTCMinutes());
+    return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
+  }
+
+  function localDatetimeValueToIso(value) {
+    if (!value) return null;
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
+  }
+
+  function startTrackingSession(data) {
+    state.sessionId = data.session_id;
+    state.times = data.times || [];
+    state.bounds = data.bounds || {};
+    state.timeIndex = 0;
+    state.track = [];
+    mapSection.hidden = false;
+    updateSlider();
+    updateTimeLabel();
+    updateTrackInfo();
+    updateDownloadLink();
+    loadFrame();
+    fetchTrack();
+  }
+
+  async function loadStormCatalog() {
+    try {
+      const res = await fetch(`${API}/api/storms`);
+      if (!res.ok) {
+        throw new Error('Failed to load storms');
+      }
+      const data = await res.json();
+      state.storms = data.storms || [];
+      stormSelect.innerHTML = '';
+      state.storms.forEach((s) => {
+        const opt = document.createElement('option');
+        opt.value = String(s.storm_id);
+        opt.textContent = `${s.storm_id}. ${s.label}`;
+        stormSelect.appendChild(opt);
+      });
+      if (state.storms.length > 0) {
+        state.selectedStormId = state.storms[0].storm_id;
+        stormSelect.value = String(state.selectedStormId);
+        updateStormDetails();
+      }
+    } catch (e) {
+      showError('Could not load storm list: ' + e.message);
+    }
+  }
+
+  function updateStormDetails() {
+    const sid = Number(stormSelect.value);
+    const s = state.storms.find((st) => Number(st.storm_id) === sid);
+    state.selectedStormId = sid;
+    if (!s) return;
+    stormMeta.innerHTML = `
+      <div><strong>Start (local):</strong> ${s.storm_start_local}</div>
+      <div><strong>End (local):</strong> ${s.storm_end_local}</div>
+    `;
+    startUtcInput.value = isoToLocalDatetimeValue(s.default_start_utc);
+    endUtcInput.value = isoToLocalDatetimeValue(s.default_end_utc);
+
+    if (s.has_water_level_plot) {
+      waterLevelPlaceholder.hidden = true;
+      waterLevelImg.hidden = false;
+      waterLevelImg.src = `${API}/api/storms/${sid}/water_level?t=${Date.now()}`;
+    } else {
+      waterLevelImg.hidden = true;
+      waterLevelPlaceholder.hidden = false;
+      waterLevelPlaceholder.textContent = 'No pre-generated water level plot for this storm.';
     }
   }
 
@@ -257,4 +341,77 @@
     clickLayer.style.width = '100%';
     clickLayer.style.height = 'auto';
   });
+  stormSelect.addEventListener('change', () => {
+    updateStormDetails();
+  });
+
+  era5Form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearError();
+    clearApiStatus();
+    if (!state.selectedStormId) {
+      showError('Select a storm first.');
+      return;
+    }
+    const startIso = localDatetimeValueToIso(startUtcInput.value);
+    const endIso = localDatetimeValueToIso(endUtcInput.value);
+    if (!startIso || !endIso) {
+      showError('Provide valid start and end datetimes.');
+      return;
+    }
+    try {
+      btnStartStorm.disabled = true;
+      showApiStatus('Downloading ERA5 data from CDS API… This may take several minutes.');
+      const res = await fetch(`${API}/api/storm/start-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          storm_id: state.selectedStormId,
+          start_utc: startIso,
+          end_utc: endIso
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showApiStatus('');
+        showError(data.detail || 'Failed to start storm session');
+        return;
+      }
+      clearApiStatus();
+      startTrackingSession(data);
+    } catch (err) {
+      clearApiStatus();
+      showError('Network error: ' + err.message);
+    } finally {
+      btnStartStorm.disabled = false;
+    }
+  });
+
+  btnUploadNc.addEventListener('click', () => fileInput.click());
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (file) handleFile(file);
+  });
+
+  btnSaveCombined.addEventListener('click', async () => {
+    if (!state.sessionId || state.track.length === 0) return;
+    try {
+      btnSaveCombined.disabled = true;
+      const res = await fetch(`${API}/api/combined/save/${state.sessionId}`, {
+        method: 'POST'
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showError(data.detail || 'Failed to save combined CSV');
+        return;
+      }
+    } catch (e) {
+      showError('Network error: ' + e.message);
+    } finally {
+      updateTrackInfo();
+    }
+  });
+
+  loadStormCatalog();
 })();
