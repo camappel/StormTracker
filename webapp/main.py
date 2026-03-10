@@ -8,9 +8,10 @@ import tempfile
 import time
 import uuid
 import warnings
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
+import imageio.v2 as imageio
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -63,6 +64,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_mast1():
+    """Load storm catalog (storm_df) from mast1.pkl."""
     if not MAST1_PATH.exists():
         raise HTTPException(status_code=500, detail=f"mast1.pkl not found at {MAST1_PATH}")
     data = pd.read_pickle(MAST1_PATH)
@@ -71,30 +73,71 @@ def _load_mast1():
     return data["storm_df"]
 
 
+def _load_mast1_full():
+    """Load full mast1.pkl (storm_df + TSP, WLP, SUP, TIP) for water-level series."""
+    if not MAST1_PATH.exists():
+        raise HTTPException(status_code=500, detail=f"mast1.pkl not found at {MAST1_PATH}")
+    data = pd.read_pickle(MAST1_PATH)
+    for key in ("storm_df", "TSP", "WLP", "SUP"):
+        if key not in data:
+            raise HTTPException(status_code=500, detail=f"mast1.pkl missing {key!r}")
+    return data
+
+
+def _storm_series_window(storm_id: int):
+    """Storm start/end (local), default UTC window (24h padding), and closure ranges in UTC."""
+    storm_df = _load_mast1()
+    group = storm_df[storm_df["Storm"] == storm_id]
+    if group.empty:
+        return None
+    storm_start = group["Start of Closure"].min()
+    storm_end = group["End of Closure"].fillna(
+        group["Start of Closure"] + pd.Timedelta(days=1)
+    ).max()
+    start_utc = storm_start.tz_localize("Europe/Amsterdam", ambiguous=False).tz_convert("UTC")
+    end_utc = storm_end.tz_localize("Europe/Amsterdam", ambiguous=False).tz_convert("UTC")
+    default_start = (start_utc - pd.Timedelta(hours=24)).strftime("%Y-%m-%dT%H:00:00Z")
+    default_end = (end_utc + pd.Timedelta(hours=24)).strftime("%Y-%m-%dT%H:00:00Z")
+    storm_windows = []
+    for _, r in group.iterrows():
+        c_start = r["Start of Closure"]
+        c_end = r["End of Closure"] if pd.notna(r["End of Closure"]) else r["Start of Closure"] + pd.Timedelta(days=1)
+        c_start_utc = c_start.tz_localize("Europe/Amsterdam", ambiguous=False).tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+        c_end_utc = c_end.tz_localize("Europe/Amsterdam", ambiguous=False).tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+        storm_windows.append({"start_utc": c_start_utc, "end_utc": c_end_utc})
+    return {
+        "storm_start": storm_start,
+        "storm_end": storm_end,
+        "default_start_utc": default_start,
+        "default_end_utc": default_end,
+        "storm_windows": storm_windows,
+    }
+
+
 def _get_storm_catalog():
     storm_df = _load_mast1()
     storm_ids = sorted(storm_df["Storm"].unique())
     rows = []
     for sid in storm_ids:
-        group = storm_df[storm_df["Storm"] == sid]
-        storm_start = group["Start of Closure"].min()
-        storm_end = group["End of Closure"].fillna(
-            group["Start of Closure"] + pd.Timedelta(days=1)
-        ).max()
-        start_utc = storm_start.tz_localize("Europe/Amsterdam", ambiguous=False).tz_convert("UTC")
-        end_utc = storm_end.tz_localize("Europe/Amsterdam", ambiguous=False).tz_convert("UTC")
-        default_start = (start_utc - pd.Timedelta(hours=24)).strftime("%Y-%m-%dT%H:00:00Z")
-        default_end = (end_utc + pd.Timedelta(hours=24)).strftime("%Y-%m-%dT%H:00:00Z")
+        win = _storm_series_window(sid)
+        if not win:
+            continue
+        storm_start = win["storm_start"]
+        storm_end = win["storm_end"]
         wl_path = WATER_LEVEL_DIR / f"water_level_storm_{sid}.png"
+        has_series = True  # all storms in catalog have mast1 data for series
         rows.append(
             {
                 "storm_id": int(sid),
                 "label": f"Storm {sid}",
                 "storm_start_local": storm_start.strftime("%Y-%m-%d %H:%M"),
                 "storm_end_local": storm_end.strftime("%Y-%m-%d %H:%M"),
-                "default_start_utc": default_start,
-                "default_end_utc": default_end,
+                "default_start_utc": win["default_start_utc"],
+                "default_end_utc": win["default_end_utc"],
                 "has_water_level_plot": wl_path.exists(),
+                "has_water_level_series": has_series,
+                "series_start_utc": win["default_start_utc"],
+                "series_end_utc": win["default_end_utc"],
             }
         )
     return rows
@@ -118,6 +161,90 @@ async def api_storm_water_level(storm_id: int):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Water level plot not found for this storm")
     return FileResponse(path, media_type="image/png")
+
+
+def _to_utc_iso(ts) -> str:
+    """Convert a timestamp (naive Europe/Amsterdam) to UTC ISO string."""
+    t = pd.Timestamp(ts)
+    if t.tz is None:
+        t = t.tz_localize("Europe/Amsterdam", ambiguous="NaT").tz_convert("UTC")
+    else:
+        t = t.tz_convert("UTC")
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@app.get("/api/storms/{storm_id}/water_level_series")
+async def api_storm_water_level_series(
+    storm_id: int,
+    hours_before: int = 168,
+    hours_after: int = 168,
+):
+    """
+    Return water level and surge time series from mast1.pkl.
+    Series is trimmed to storm_start - hours_before through storm_end + hours_after.
+    Default is 7 days each side for slider boundaries.
+    default_start_utc / default_end_utc use 62h each side for initial handle positions.
+    """
+    win = _storm_series_window(storm_id)
+    if not win:
+        raise HTTPException(status_code=404, detail="Storm not found")
+    hours_before = max(0, min(168, hours_before))
+    hours_after = max(0, min(168, hours_after))
+    tmin = win["storm_start"] - pd.Timedelta(hours=int(hours_before))
+    tmax = win["storm_end"] + pd.Timedelta(hours=int(hours_after))
+    data = _load_mast1_full()
+    TSP = pd.to_datetime(np.asarray(data["TSP"]))
+    WLP = np.asarray(data["WLP"], dtype=float)
+    SUP = np.asarray(data["SUP"], dtype=float)
+    TIP = np.asarray(data["TIP"], dtype=float) if "TIP" in data else np.full_like(WLP, np.nan)
+    tmin_ = pd.Timestamp(tmin)
+    tmax_ = pd.Timestamp(tmax)
+    mask = (TSP >= tmin_) & (TSP <= tmax_)
+    if not np.any(mask):
+        return {
+            "series": [],
+            "full_series_start_utc": win["default_start_utc"],
+            "full_series_end_utc": win["default_end_utc"],
+            "default_start_utc": win["default_start_utc"],
+            "default_end_utc": win["default_end_utc"],
+            "storm_windows": win.get("storm_windows", []),
+        }
+    tsp = TSP[mask]
+    wlp = WLP[mask]
+    sup = SUP[mask]
+    tip = TIP[mask]
+    hourly = pd.date_range(
+        start=pd.Timestamp(tmin).floor("h"),
+        end=pd.Timestamp(tmax).ceil("h"),
+        freq="h",
+    )
+    series = []
+    for h in hourly:
+        ht = pd.Timestamp(h)
+        if ht.tz is not None:
+            ht = ht.tz_convert("Europe/Amsterdam").tz_localize(None)
+        diff = np.abs(tsp - ht)
+        idx = np.argmin(diff)
+        time_utc = _to_utc_iso(tsp[idx])
+        wl = float(wlp[idx]) if not np.isnan(wlp[idx]) else None
+        sg = float(sup[idx]) if not np.isnan(sup[idx]) else None
+        td = float(tip[idx]) if not np.isnan(tip[idx]) else None
+        series.append({
+            "time_utc": time_utc,
+            "water_level": wl,
+            "surge": sg,
+            "tide": td,
+        })
+    full_start = series[0]["time_utc"] if series else win["default_start_utc"]
+    full_end = series[-1]["time_utc"] if series else win["default_end_utc"]
+    return {
+        "series": series,
+        "full_series_start_utc": full_start,
+        "full_series_end_utc": full_end,
+        "default_start_utc": win["default_start_utc"],
+        "default_end_utc": win["default_end_utc"],
+        "storm_windows": win.get("storm_windows", []),
+    }
 
 
 class TrackAddBody(BaseModel):
@@ -216,11 +343,18 @@ def add_map_base(ax, xlim, ylim):
     ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.5, color="white")
     ax.set_xlim(xlim)
     ax.set_ylim(ylim)
-    ax.gridlines(draw_labels=True, linewidth=0.5, color="gray", alpha=0.5, linestyle="--")
+    # Fill the full axes area; prevents top/bottom bands in the rendered PNG.
+    ax.set_aspect("auto")
+    # Keep reference grid but avoid outer label margins so image pixels map
+    # directly to lon/lat bounds for click-to-point accuracy.
+    ax.gridlines(draw_labels=False, linewidth=0.5, color="gray", alpha=0.5, linestyle="--")
 
 
-def render_frame(session: dict, time_index: int, track: list) -> bytes:
-    """Render one time step as PNG: pressure + wind + track overlay."""
+def render_frame(session: dict, time_index: int, track: list, *, show_track_points: bool = True) -> bytes:
+    """Render one time step as PNG: pressure + wind + track overlay.
+
+    When show_track_points is False, only the track line is drawn (no point markers).
+    """
     LON = session["LON"]
     LAT = session["LAT"]
     P_MET = session["P_MET"]
@@ -260,8 +394,13 @@ def render_frame(session: dict, time_index: int, track: list) -> bytes:
         lat_inds[0] : lat_inds[-1] + 1 : INT_SKIP,
         lon_inds[0] : lon_inds[-1] + 1 : INT_SKIP,
     ]
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    lon_span = float(XB_MET[1] - XB_MET[0])
+    lat_span = float(YB_MET[1] - YB_MET[0])
+    map_ratio = lon_span / lat_span if lat_span else 1.5
+    fig_height = 8.0
+    fig = plt.figure(figsize=(fig_height * map_ratio, fig_height))
+    # Fill the full canvas to eliminate outer whitespace.
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], projection=ccrs.PlateCarree())
     add_map_base(ax, XB_MET, YB_MET)
     ax.pcolormesh(
         X_sub,
@@ -294,17 +433,28 @@ def render_frame(session: dict, time_index: int, track: list) -> bytes:
             transform=ccrs.PlateCarree(),
             zorder=10,
         )
-        ax.scatter(
-            track_lons,
-            track_lats,
-            c="darkred",
-            s=30,
-            zorder=11,
-            transform=ccrs.PlateCarree(),
-        )
+        if show_track_points:
+            ax.scatter(
+                track_lons,
+                track_lats,
+                c="darkred",
+                s=30,
+                zorder=11,
+                transform=ccrs.PlateCarree(),
+            )
     ts_str = pd.Timestamp(grid_time).strftime("%Y-%m-%d %H:%M UTC")
-    ax.set_title(f"StormTracker — {ts_str} (step {time_index + 1}/{len(frame_list)})", fontsize=12)
-    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.93)
+    ax.text(
+        0.01,
+        0.99,
+        f"{ts_str} (step {time_index + 1}/{len(frame_list)})",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=11,
+        color="white",
+        bbox={"facecolor": "black", "alpha": 0.35, "pad": 3, "edgecolor": "none"},
+        zorder=20,
+    )
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=100, bbox_inches=None, pad_inches=0)
     plt.close(fig)
@@ -416,23 +566,78 @@ async def api_start_storm_session(body: StartStormSessionBody):
                 detail="cdsapi is not installed on the server; cannot download ERA5 automatically.",
             )
 
-        client = cdsapi.Client()
-        request = {
-            "product_type": "reanalysis",
-            "variable": [
-                "mean_sea_level_pressure",
-                "10m_u_component_of_wind",
-                "10m_v_component_of_wind",
-            ],
-            "year": [f"{t_start.year:04d}"],
-            "month": [f"{t_start.month:02d}"],
-            "day": [f"{d:02d}" for d in range(1, 32)],
-            "time": [f"{h:02d}:00" for h in range(24)],
-            "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
-            "format": "netcdf",
-        }
+        start_date = t_start.date()
+        end_date = t_end.date()
+        same_day = start_date == end_date
+        if same_day:
+            hours_in_range = list(range(t_start.hour, t_end.hour + 1))
+        else:
+            hours_in_range = list(range(24))
+        if not hours_in_range:
+            raise HTTPException(status_code=400, detail="Invalid time range")
+
         ERA5_DIR.mkdir(parents=True, exist_ok=True)
-        client.retrieve("reanalysis-era5-single-levels", request).download(str(era5_path))
+        client = cdsapi.Client()
+
+        if start_date.year == end_date.year and start_date.month == end_date.month:
+            days_in_range = list(range(start_date.day, end_date.day + 1))
+            request = {
+                "product_type": "reanalysis",
+                "variable": [
+                    "mean_sea_level_pressure",
+                    "10m_u_component_of_wind",
+                    "10m_v_component_of_wind",
+                ],
+                "year": [f"{t_start.year:04d}"],
+                "month": [f"{t_start.month:02d}"],
+                "day": [f"{d:02d}" for d in days_in_range],
+                "time": [f"{h:02d}:00" for h in hours_in_range],
+                "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
+                "format": "netcdf",
+            }
+            client.retrieve("reanalysis-era5-single-levels", request).download(str(era5_path))
+        else:
+            paths_to_merge = []
+            cur = start_date
+            while cur <= end_date:
+                y, m = cur.year, cur.month
+                month_end = date(y, m + 1, 1) - timedelta(days=1) if m < 12 else date(y, 12, 31)
+                d_start = cur.day if (cur.year, cur.month) == (start_date.year, start_date.month) else 1
+                d_end = end_date.day if (end_date.year, end_date.month) == (y, m) else month_end.day
+                if cur == start_date and start_date != end_date:
+                    use_hours = list(range(t_start.hour, 24))
+                elif (end_date.year, end_date.month, end_date.day) == (y, m, d_end) and start_date != end_date:
+                    use_hours = list(range(0, t_end.hour + 1))
+                else:
+                    use_hours = list(range(24))
+                request = {
+                    "product_type": "reanalysis",
+                    "variable": [
+                        "mean_sea_level_pressure",
+                        "10m_u_component_of_wind",
+                        "10m_v_component_of_wind",
+                    ],
+                    "year": [f"{y:04d}"],
+                    "month": [f"{m:02d}"],
+                    "day": [f"{d:02d}" for d in range(d_start, d_end + 1)],
+                    "time": [f"{h:02d}:00" for h in use_hours],
+                    "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
+                    "format": "netcdf",
+                }
+                part_path = ERA5_DIR / f"ERA5_{storm_id}_{y:04d}{m:02d}_part.nc"
+                client.retrieve("reanalysis-era5-single-levels", request).download(str(part_path))
+                paths_to_merge.append(part_path)
+                cur = month_end + timedelta(days=1)
+            if len(paths_to_merge) == 1:
+                paths_to_merge[0].rename(era5_path)
+            else:
+                ds_list = [xr.open_dataset(p) for p in paths_to_merge]
+                combined = xr.concat(sorted(ds_list, key=lambda d: d["valid_time"].values[0]), dim="valid_time")
+                for ds in ds_list:
+                    ds.close()
+                combined.to_netcdf(era5_path)
+                for p in paths_to_merge:
+                    p.unlink(missing_ok=True)
 
     return _create_session_from_era5(era5_path, storm_id=storm_id)
 
@@ -535,6 +740,80 @@ async def api_csv(session_id: str):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=storm_track.csv"},
     )
+
+
+def _labelled_window_indices(session: dict, pad_hours: int = 3) -> tuple[int, int]:
+    """Return (start_idx, end_idx) in frame_list covering labelled track ± pad_hours.
+
+    Clamps to available frame indices.
+    """
+    track = session.get("track") or []
+    frame_list = session["frame_list"]
+    if not track or not frame_list:
+        raise HTTPException(status_code=400, detail="Track is empty; cannot determine labelled window")
+
+    # Track indices are in terms of frame_list indices
+    t_indices = [int(p["time_index"]) for p in track]
+    first_idx = max(0, min(t_indices))
+    last_idx = min(len(frame_list) - 1, max(t_indices))
+
+    _, first_time = frame_list[first_idx]
+    _, last_time = frame_list[last_idx]
+
+    start_target = pd.Timestamp(first_time) - pd.Timedelta(hours=pad_hours)
+    end_target = pd.Timestamp(last_time) + pd.Timedelta(hours=pad_hours)
+
+    frame_times = [pd.Timestamp(t) for _, t in frame_list]
+
+    # Find earliest index with time >= start_target
+    start_idx = 0
+    for i, t in enumerate(frame_times):
+        if t >= start_target:
+            start_idx = i
+            break
+
+    # Find latest index with time <= end_target
+    end_idx = len(frame_times) - 1
+    for i in range(len(frame_times) - 1, -1, -1):
+        if frame_times[i] <= end_target:
+            end_idx = i
+            break
+
+    start_idx = max(0, min(start_idx, len(frame_list) - 1))
+    end_idx = max(start_idx, min(end_idx, len(frame_list) - 1))
+    return start_idx, end_idx
+
+
+@app.get("/api/gif/era5/{session_id}")
+async def api_era5_gif(session_id: str):
+    """Generate an ERA5 GIF over the labelled window ±3h with full track line in every frame (no point markers)."""
+    session = get_session(session_id)
+    session["last_access"] = time.time()
+    track = session.get("track") or []
+    if not track:
+        raise HTTPException(status_code=400, detail="Track is empty; label at least one point first")
+
+    start_idx, end_idx = _labelled_window_indices(session, pad_hours=3)
+    frame_indices = list(range(start_idx, end_idx + 1))
+    if not frame_indices:
+        raise HTTPException(status_code=400, detail="No frames available for labelled window")
+
+    # Use full track (constant across frames)
+    frames: list[np.ndarray] = []
+    for ti in frame_indices:
+        png_bytes = render_frame(session, ti, track, show_track_points=False)
+        buf = io.BytesIO(png_bytes)
+        img = imageio.imread(buf)
+        frames.append(img)
+
+    if not frames:
+        raise HTTPException(status_code=500, detail="Failed to render any GIF frames")
+
+    out = io.BytesIO()
+    # Use FPS similar to analysis notebook GIFs
+    imageio.mimsave(out, frames, format="GIF", loop=0, fps=4)
+    out.seek(0)
+    return Response(content=out.read(), media_type="image/gif")
 
 
 @app.post("/api/combined/save/{session_id}")
