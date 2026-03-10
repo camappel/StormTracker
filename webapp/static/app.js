@@ -1,27 +1,71 @@
 (function () {
   const API = ''; // same origin
+  if (typeof Chart !== 'undefined' && window['chartjs-plugin-annotation']) {
+    Chart.register(window['chartjs-plugin-annotation']);
+  }
   let state = {
     sessionId: null,
     bounds: null,
     times: [],
     timeIndex: 0,
     track: [],
-    mode: 'add'
+    mode: 'add',
+    storms: [],
+    selectedStormId: null,
+    waterSeries: [],
+    window: { startIndex: 0, endIndex: 0 },
+    stormWindows: [],
+    barrierStartUtc: null,
+    barrierEndUtc: null,
+    defaultCurrentUtc: null,
+    activeStartIdx: 0,
+    activeEndIdx: 0,
+    waterTideChart: null,
+    surgeChart: null,
+    era5StartUtc: null,
+    era5EndUtc: null,
+    plotStartUtc: null,
+    plotEndUtc: null,
+    candidateEra5StartUtc: null,
+    candidateEra5EndUtc: null,
+    sliderInternalUpdate: false,
+    autoStartTimer: null,
+    lastAutoStartKey: null,
+    autoStartRequestId: 0
   };
 
-  const uploadZone = document.getElementById('upload-zone');
-  const fileInput = document.getElementById('file-input');
+  const stormSelect = document.getElementById('storm-select');
+  const stormMeta = document.getElementById('storm-meta');
+  const waterLevelPlaceholder = document.getElementById('water-level-placeholder');
+  const waterLevelLoading = document.getElementById('water-level-loading');
+  const waterLevelError = document.getElementById('water-level-error');
+  const waterLevelChartWrap = document.getElementById('water-level-chart-wrap');
+  const waterTideChartCanvas = document.getElementById('water-tide-chart');
+  const surgeChartCanvas = document.getElementById('surge-chart');
+  const era5WindowSection = document.getElementById('era5-window-section');
+  const btnEra5Reset = document.getElementById('btn-era5-reset');
+  const btnEra5Update = document.getElementById('btn-era5-update');
+  const activeFirstFrameEl = document.getElementById('active-first-frame');
+  const activeCurrentFrameEl = document.getElementById('active-current-frame');
+  const activeLastFrameEl = document.getElementById('active-last-frame');
+  const activeFrameCountEl = document.getElementById('active-frame-count');
+  const startUtcInput = document.getElementById('start-utc');
+  const endUtcInput = document.getElementById('end-utc');
   const uploadError = document.getElementById('upload-error');
-  const uploadSection = document.getElementById('upload-section');
+  const apiStatus = document.getElementById('api-status');
   const mapSection = document.getElementById('map-section');
   const frameImg = document.getElementById('frame-img');
   const clickLayer = document.getElementById('click-layer');
-  const timeSlider = document.getElementById('time-slider');
-  const timeLabel = document.getElementById('time-label');
-  const btnPrev = document.getElementById('btn-prev');
-  const btnNext = document.getElementById('btn-next');
+  const timeWindowSliderEl = document.getElementById('time-window-slider');
   const btnDownload = document.getElementById('btn-download');
+  const btnSaveCombined = document.getElementById('btn-save-combined');
+  const btnDownloadCombined = document.getElementById('btn-download-combined');
   const trackInfo = document.getElementById('track-info');
+  const gifSection = document.getElementById('gif-section');
+  const btnGenerateGif = document.getElementById('btn-generate-gif');
+  const gifStatus = document.getElementById('gif-status');
+  const gifPreviewWrap = document.getElementById('gif-preview-wrap');
+  const gifImg = document.getElementById('era5-gif');
 
   function showError(msg) {
     uploadError.textContent = msg;
@@ -33,41 +77,190 @@
     uploadError.hidden = true;
   }
 
+  function showApiStatus(msg) {
+    if (apiStatus) {
+      apiStatus.textContent = msg;
+      apiStatus.hidden = false;
+    }
+  }
+
+  function clearApiStatus() {
+    if (apiStatus) {
+      apiStatus.textContent = '';
+      apiStatus.hidden = true;
+    }
+  }
+
   function pixelToLonLat(x, y) {
     const b = state.bounds;
     if (!b) return null;
-    const rect = clickLayer.getBoundingClientRect();
+    // Use the displayed image bounds (not the full overlay) so mapping stays
+    // accurate even if the container includes tiny letterbox bands.
+    const rect = frameImg.getBoundingClientRect();
     const w = rect.width;
     const h = rect.height;
-    const fracX = (x - rect.left) / w;
-    const fracY = (y - rect.top) / h;
+    if (w <= 0 || h <= 0) return null;
+    const relX = x - rect.left;
+    const relY = y - rect.top;
+    if (relX < 0 || relX > w || relY < 0 || relY > h) return null;
+    const fracX = relX / w;
+    const fracY = relY / h;
     const lon = b.lon_min + fracX * (b.lon_max - b.lon_min);
     const lat = b.lat_max - fracY * (b.lat_max - b.lat_min);
     return { lon, lat };
   }
 
   function updateTimeLabel() {
-    const n = state.times.length;
-    const i = state.timeIndex + 1;
-    const t = state.times[state.timeIndex];
-    timeLabel.textContent = `Step ${i} / ${n}${t ? ' — ' + t.time_utc : ''}`;
+    // Current frame is represented by map image + center slider handle.
+  }
+
+  function sliderTooltipForIndex(idx) {
+    const i = Math.max(0, Math.min(idx, state.times.length - 1));
+    const t = state.times[i];
+    return t && t.time_utc ? t.time_utc.slice(5, 16).replace('T', ' ') : String(i + 1);
+  }
+
+  function isoAtIndex(idx) {
+    const i = Math.max(0, Math.min(idx, state.times.length - 1));
+    const t = state.times[i];
+    return t && t.time_utc ? t.time_utc : null;
+  }
+
+  function setEra5UpdateButtonDirty(isDirty) {
+    if (!btnEra5Update) return;
+    btnEra5Update.disabled = !isDirty;
+    btnEra5Update.classList.toggle('primary-button', Boolean(isDirty));
+    btnEra5Update.classList.toggle('secondary-button', !isDirty);
+  }
+
+  function refreshEra5CandidateFromSlider() {
+    state.candidateEra5StartUtc = isoAtIndex(state.activeStartIdx);
+    state.candidateEra5EndUtc = isoAtIndex(state.activeEndIdx);
+    const dirty = Boolean(
+      state.candidateEra5StartUtc &&
+      state.candidateEra5EndUtc &&
+      (state.candidateEra5StartUtc !== state.era5StartUtc || state.candidateEra5EndUtc !== state.era5EndUtc)
+    );
+    setEra5UpdateButtonDirty(dirty);
+  }
+
+  function updateChartViewport(minUtc, maxUtc) {
+    if (!minUtc || !maxUtc) return;
+    const charts = [state.waterTideChart, state.surgeChart];
+    charts.forEach((chart) => {
+      if (!chart) return;
+      if (chart.options.scales && chart.options.scales.x) {
+        chart.options.scales.x.min = minUtc;
+        chart.options.scales.x.max = maxUtc;
+        chart.update('none');
+      }
+    });
+  }
+
+  function updateEra5LineAnnotations(startIso, endIso) {
+    const charts = [state.waterTideChart, state.surgeChart];
+    charts.forEach((chart) => {
+      if (!chart || !chart.options || !chart.options.plugins || !chart.options.plugins.annotation) return;
+      const anns = chart.options.plugins.annotation.annotations || {};
+      if (startIso && anns['era5-start-line']) {
+        anns['era5-start-line'].xMin = startIso;
+        anns['era5-start-line'].xMax = startIso;
+      }
+      if (endIso && anns['era5-end-line']) {
+        anns['era5-end-line'].xMin = endIso;
+        anns['era5-end-line'].xMax = endIso;
+      }
+      chart.update('none');
+    });
+  }
+
+  function lockOuterSliderHandles() {
+    if (!timeWindowSliderEl) return;
+    const origins = timeWindowSliderEl.querySelectorAll('.noUi-origin');
+    if (!origins || origins.length < 3) return;
+    const setHandleDisabled = function (originEl, disabled) {
+      originEl.style.pointerEvents = disabled ? 'none' : '';
+      const handle = originEl.querySelector('.noUi-handle');
+      if (handle) {
+        handle.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+      }
+    };
+    setHandleDisabled(origins[0], true);
+    setHandleDisabled(origins[1], false);
+    setHandleDisabled(origins[2], true);
+  }
+
+  function ensureWindowSlider() {
+    if (!timeWindowSliderEl || typeof noUiSlider === 'undefined') return;
+    if (timeWindowSliderEl.noUiSlider) return;
+    noUiSlider.create(timeWindowSliderEl, {
+      start: [0, 0, 0],
+      connect: [false, true, true, false],
+      step: 1,
+      behaviour: 'drag',
+      range: { min: 0, max: 1 },
+      tooltips: [
+        { to: (v) => sliderTooltipForIndex(Math.round(v)) },
+        { to: (v) => sliderTooltipForIndex(Math.round(v)) },
+        { to: (v) => sliderTooltipForIndex(Math.round(v)) }
+      ],
+      format: {
+        to: (v) => String(Math.round(v)),
+        from: (v) => Number(v)
+      }
+    });
+    lockOuterSliderHandles();
+    timeWindowSliderEl.noUiSlider.on('update', (values) => {
+      if (state.sliderInternalUpdate || !state.times.length) return;
+      const n = state.times.length;
+      let currentIdx = Math.round(Number(values[1]));
+      const startIdx = Math.max(0, Math.min(state.activeStartIdx, n - 1));
+      const endIdx = Math.max(startIdx, Math.min(state.activeEndIdx, n - 1));
+      if (currentIdx < startIdx) currentIdx = startIdx;
+      if (currentIdx > endIdx) currentIdx = endIdx;
+      state.timeIndex = currentIdx;
+      updateTimeLabel();
+      updateFrameWindowStatus();
+      updateCurrentFrameMarker();
+      loadFrame();
+      const normalized = [startIdx, currentIdx, endIdx];
+      if (
+        Math.round(Number(values[0])) !== startIdx ||
+        currentIdx !== Math.round(Number(values[1])) ||
+        Math.round(Number(values[2])) !== endIdx
+      ) {
+        state.sliderInternalUpdate = true;
+        timeWindowSliderEl.noUiSlider.set(normalized);
+        state.sliderInternalUpdate = false;
+      }
+    });
   }
 
   function updateSlider() {
     const n = state.times.length;
-    timeSlider.min = 0;
-    timeSlider.max = Math.max(0, n - 1);
-    timeSlider.value = state.timeIndex;
-    timeSlider.disabled = n <= 1;
-    btnPrev.disabled = n <= 1 || state.timeIndex <= 0;
-    btnNext.disabled = n <= 1 || state.timeIndex >= n - 1;
+    ensureWindowSlider();
+    if (!timeWindowSliderEl || !timeWindowSliderEl.noUiSlider) return;
+    const minIdx = Math.max(0, Math.min(state.activeStartIdx, n - 1));
+    const maxIdx = Math.max(minIdx, Math.min(state.activeEndIdx, n - 1));
+    if (state.timeIndex < minIdx) state.timeIndex = minIdx;
+    if (state.timeIndex > maxIdx) state.timeIndex = maxIdx;
+    const slider = timeWindowSliderEl.noUiSlider;
+    state.sliderInternalUpdate = true;
+    slider.updateOptions({ range: { min: 0, max: Math.max(1, n - 1) } }, false);
+    slider.set([minIdx, state.timeIndex, maxIdx]);
+    state.sliderInternalUpdate = false;
+    lockOuterSliderHandles();
   }
 
   function updateTrackInfo() {
     const n = state.track.length;
     trackInfo.textContent = n === 0
       ? 'No track points. Click on map in "Add point" mode to add.'
-      : `${n} track point(s). Download CSV when done.`;
+      : `${n} track point(s). Save to combined CSV when done.`;
+    btnSaveCombined.disabled = !state.sessionId || n === 0;
+    if (btnGenerateGif) {
+      btnGenerateGif.disabled = !state.sessionId || n === 0;
+    }
   }
 
   function updateDownloadLink() {
@@ -78,6 +271,57 @@
     }
     btnDownload.href = `${API}/api/csv/${state.sessionId}`;
     btnDownload.style.visibility = 'visible';
+  }
+
+  function clearGifPreview() {
+    if (gifImg) {
+      gifImg.src = '';
+    }
+    if (gifPreviewWrap) {
+      gifPreviewWrap.hidden = true;
+    }
+    if (gifStatus) {
+      gifStatus.textContent = '';
+      gifStatus.hidden = true;
+    }
+  }
+
+  function showGifStatus(msg) {
+    if (!gifStatus) return;
+    gifStatus.textContent = msg;
+    gifStatus.hidden = !msg;
+  }
+
+  async function generateGif() {
+    if (!state.sessionId || !state.track.length || !btnGenerateGif) return;
+    try {
+      btnGenerateGif.disabled = true;
+      showGifStatus('Generating ERA5 GIF…');
+      clearError();
+      const url = `${API}/api/gif/era5/${state.sessionId}`;
+      // Use a cache-busting query param so updated GIFs reload
+      const gifUrl = `${url}?t=${Date.now()}`;
+      if (gifImg && gifPreviewWrap) {
+        gifImg.onload = function () {
+          showGifStatus('');
+        };
+        gifImg.onerror = function () {
+          showGifStatus('Failed to load ERA5 GIF.');
+        };
+        gifImg.src = gifUrl;
+        gifPreviewWrap.hidden = false;
+      } else {
+        // Fallback: open in new tab
+        window.open(gifUrl, '_blank');
+        showGifStatus('');
+      }
+    } catch (e) {
+      showGifStatus('Error generating ERA5 GIF: ' + e.message);
+    } finally {
+      if (btnGenerateGif) {
+        btnGenerateGif.disabled = !state.sessionId || !state.track.length;
+      }
+    }
   }
 
   function loadFrame() {
@@ -154,80 +398,710 @@
     loadFrame();
   }
 
-  uploadZone.addEventListener('click', () => fileInput.click());
-  uploadZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    uploadZone.classList.add('dragover');
-  });
-  uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
-  uploadZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    uploadZone.classList.remove('dragover');
-    const file = e.dataTransfer.files[0];
-    if (file && file.name.toLowerCase().endsWith('.nc')) handleFile(file);
-    else showError('Please drop a .nc file.');
-  });
-  fileInput.addEventListener('change', () => {
-    const file = fileInput.files[0];
-    if (file) handleFile(file);
-  });
+  function formatIsoForDisplay(isoString) {
+    if (!isoString) return '—';
+    const d = new Date(isoString);
+    if (Number.isNaN(d.getTime())) return '—';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+  }
 
-  async function handleFile(file) {
+  function parseSessionUtc(value) {
+    if (!value) return null;
+    const s = String(value).trim().replace(' ', 'T');
+    const iso = s.endsWith('Z') ? s : `${s}Z`;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  function sessionIndexTimeMs(idx) {
+    if (idx < 0 || idx >= state.times.length) return NaN;
+    const t = parseSessionUtc(state.times[idx].time_utc);
+    return t ? t.getTime() : NaN;
+  }
+
+  function computeBarrierBounds() {
+    const windows = state.stormWindows || [];
+    if (!windows.length) return null;
+    let startIso = windows[0].start_utc;
+    let endIso = windows[0].end_utc;
+    windows.forEach((w) => {
+      if (w.start_utc < startIso) startIso = w.start_utc;
+      if (w.end_utc > endIso) endIso = w.end_utc;
+    });
+    return { startUtc: startIso, endUtc: endIso };
+  }
+
+  function updateFrameWindowStatus() {
+    const n = state.times.length;
+    if (!activeFirstFrameEl || !activeLastFrameEl || !activeFrameCountEl || n === 0) {
+      return;
+    }
+    const startIdx = Math.max(0, Math.min(state.activeStartIdx, n - 1));
+    const endIdx = Math.max(startIdx, Math.min(state.activeEndIdx, n - 1));
+    const currentIdx = Math.max(startIdx, Math.min(state.timeIndex, endIdx));
+    const firstIso = state.times[startIdx] ? parseSessionUtc(state.times[startIdx].time_utc) : null;
+    const currentIso = state.times[currentIdx] ? parseSessionUtc(state.times[currentIdx].time_utc) : null;
+    const lastIso = state.times[endIdx] ? parseSessionUtc(state.times[endIdx].time_utc) : null;
+    activeFirstFrameEl.textContent = firstIso ? formatIsoForDisplay(firstIso.toISOString()) : '—';
+    if (activeCurrentFrameEl) {
+      activeCurrentFrameEl.textContent = currentIso ? formatIsoForDisplay(currentIso.toISOString()) : '—';
+    }
+    activeLastFrameEl.textContent = lastIso ? formatIsoForDisplay(lastIso.toISOString()) : '—';
+    activeFrameCountEl.textContent = String(endIdx - startIdx + 1);
+  }
+
+  function setActiveWindowIndices(startIdx, endIdx, opts) {
+    const n = state.times.length;
+    if (n === 0) return false;
+    const minSpan = 2;
+    const nextStart = Math.max(0, Math.min(startIdx, n - 1));
+    const nextEnd = Math.max(nextStart, Math.min(endIdx, n - 1));
+    if (nextEnd - nextStart + 1 < minSpan) {
+      showError(`Window must keep at least ${minSpan} frames.`);
+      return false;
+    }
+    state.activeStartIdx = nextStart;
+    state.activeEndIdx = nextEnd;
+    if (state.timeIndex < nextStart) state.timeIndex = nextStart;
+    if (state.timeIndex > nextEnd) state.timeIndex = nextEnd;
+    updateSlider();
+    refreshEra5CandidateFromSlider();
+    updateEra5LineAnnotations(state.candidateEra5StartUtc, state.candidateEra5EndUtc);
+    updateTimeLabel();
+    updateFrameWindowStatus();
+    updateCurrentFrameMarker();
+    if (!opts || opts.reloadFrame !== false) {
+      loadFrame();
+    }
+    return true;
+  }
+
+  function nearestStartIndexForTimeMs(targetMs) {
+    const n = state.times.length;
+    for (let i = 0; i < n; i++) {
+      const ms = sessionIndexTimeMs(i);
+      if (Number.isFinite(ms) && ms >= targetMs) return i;
+    }
+    return n - 1;
+  }
+
+  function nearestEndIndexForTimeMs(targetMs) {
+    for (let i = state.times.length - 1; i >= 0; i--) {
+      const ms = sessionIndexTimeMs(i);
+      if (Number.isFinite(ms) && ms <= targetMs) return i;
+    }
+    return 0;
+  }
+
+  function nearestIndexInRangeForTimeMs(targetMs, startIdx, endIdx) {
+    if (!state.times.length) return 0;
+    let bestIdx = Math.max(0, Math.min(startIdx, state.times.length - 1));
+    let bestDiff = Infinity;
+    for (let i = bestIdx; i <= Math.max(bestIdx, endIdx); i++) {
+      const ms = sessionIndexTimeMs(i);
+      if (!Number.isFinite(ms)) continue;
+      const diff = Math.abs(ms - targetMs);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  function setEra5Window(startIso, endIso) {
+    startUtcInput.value = startIso || '';
+    endUtcInput.value = endIso || '';
+    state.candidateEra5StartUtc = startIso || null;
+    state.candidateEra5EndUtc = endIso || null;
+  }
+
+  function syncSessionToEra5Window() {
+    const startIso = startUtcInput.value;
+    const endIso = endUtcInput.value;
+    if (!startIso || !endIso) return;
+    if (!state.sessionId || !state.times.length) {
+      startStormSessionAutomatically(true);
+      return;
+    }
+    const sessionStartMs = sessionIndexTimeMs(0);
+    const sessionEndMs = sessionIndexTimeMs(state.times.length - 1);
+    const targetStartMs = new Date(startIso).getTime();
+    const targetEndMs = new Date(endIso).getTime();
+    const insideSession = targetStartMs >= sessionStartMs && targetEndMs <= sessionEndMs;
+    if (!insideSession) {
+      showApiStatus('Updating selected range: downloading ERA5 data…');
+      startStormSessionAutomatically(true);
+      return;
+    }
+    const startIdx = nearestStartIndexForTimeMs(targetStartMs);
+    const endIdx = nearestEndIndexForTimeMs(targetEndMs);
+    setActiveWindowIndices(startIdx, endIdx, { reloadFrame: false });
+    if (state.timeIndex < state.activeStartIdx) state.timeIndex = state.activeStartIdx;
+    if (state.timeIndex > state.activeEndIdx) state.timeIndex = state.activeEndIdx;
+    updateSlider();
+    updateTimeLabel();
+    updateFrameWindowStatus();
+    updateCurrentFrameMarker();
+    loadFrame();
+  }
+
+  function computeDefaultWindows(series) {
+    const barrier = computeBarrierBounds();
+    const seriesStartIso = series[0] && series[0].time_utc;
+    const seriesEndIso = series[series.length - 1] && series[series.length - 1].time_utc;
+    const msPerHour = 3600000;
+
+    function toMs(iso) {
+      const d = new Date(iso);
+      return Number.isNaN(d.getTime()) ? NaN : d.getTime();
+    }
+
+    let mainStartMs;
+    let mainEndMs;
+    let era5StartMs;
+    let era5EndMs;
+
+    if (barrier) {
+      const startMs = toMs(barrier.startUtc);
+      const endMs = toMs(barrier.endUtc);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        return null;
+      }
+      mainStartMs = startMs - 62 * msPerHour;
+      mainEndMs = endMs + 62 * msPerHour;
+      era5StartMs = startMs - 24 * msPerHour;
+      era5EndMs = endMs + 24 * msPerHour;
+    } else {
+      // Fallback: center on max surge time, otherwise midpoint of series
+      let centerMs = NaN;
+      if (series && series.length) {
+        let maxSurge = -Infinity;
+        let maxSurgeMs = NaN;
+        series.forEach((p) => {
+          if (p.surge != null && !Number.isNaN(p.surge)) {
+            const tMs = toMs(p.time_utc);
+            if (Number.isFinite(tMs) && p.surge > maxSurge) {
+              maxSurge = p.surge;
+              maxSurgeMs = tMs;
+            }
+          }
+        });
+        if (Number.isFinite(maxSurgeMs)) {
+          centerMs = maxSurgeMs;
+        } else {
+          const startMs = toMs(seriesStartIso);
+          const endMs = toMs(seriesEndIso);
+          if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+            centerMs = startMs + (endMs - startMs) / 2;
+          }
+        }
+      }
+      if (!Number.isFinite(centerMs)) {
+        return null;
+      }
+      mainStartMs = centerMs - 62 * msPerHour;
+      mainEndMs = centerMs + 62 * msPerHour;
+      era5StartMs = centerMs - 24 * msPerHour;
+      era5EndMs = centerMs + 24 * msPerHour;
+    }
+
+    const clampToSeries = (ms) => {
+      const startMs = toMs(seriesStartIso);
+      const endMs = toMs(seriesEndIso);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return ms;
+      return Math.min(Math.max(ms, startMs), endMs);
+    };
+
+    mainStartMs = clampToSeries(mainStartMs);
+    mainEndMs = clampToSeries(mainEndMs);
+    era5StartMs = clampToSeries(era5StartMs);
+    era5EndMs = clampToSeries(era5EndMs);
+
+    return {
+      mainStartUtc: new Date(mainStartMs).toISOString(),
+      mainEndUtc: new Date(mainEndMs).toISOString(),
+      era5StartUtc: new Date(era5StartMs).toISOString(),
+      era5EndUtc: new Date(era5EndMs).toISOString()
+    };
+  }
+
+  async function startStormSessionAutomatically(force) {
     clearError();
-    const form = new FormData();
-    form.append('file', file);
+    if (!state.selectedStormId) return;
+    const startIso = startUtcInput.value && startUtcInput.value.trim() ? startUtcInput.value.trim() : null;
+    const endIso = endUtcInput.value && endUtcInput.value.trim() ? endUtcInput.value.trim() : null;
+    if (!startIso || !endIso) return;
+    if (new Date(endIso) <= new Date(startIso)) {
+      showError('End time must be after start time.');
+      return;
+    }
+    const key = `${state.selectedStormId}|${startIso}|${endIso}`;
+    if (!force && state.lastAutoStartKey === key) return;
+    const requestId = ++state.autoStartRequestId;
+    showApiStatus('Downloading ERA5 data from CDS API… This may take several minutes.');
     try {
-      const res = await fetch(`${API}/api/upload`, {
+      const res = await fetch(`${API}/api/storm/start-session`, {
         method: 'POST',
-        body: form
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          storm_id: state.selectedStormId,
+          start_utc: startIso,
+          end_utc: endIso
+        })
       });
       const data = await res.json();
+      if (requestId !== state.autoStartRequestId) return;
       if (!res.ok) {
-        showError(data.detail || 'Upload failed');
+        showApiStatus('');
+        showError(data.detail || 'Failed to start storm session');
         return;
       }
-      state.sessionId = data.session_id;
-      state.times = data.times || [];
-      state.bounds = data.bounds || {};
-      state.timeIndex = 0;
-      state.track = [];
-      uploadSection.hidden = true;
-      mapSection.hidden = false;
-      updateSlider();
-      updateTimeLabel();
-      updateTrackInfo();
-      updateDownloadLink();
-      loadFrame();
-      await fetchTrack();
-    } catch (e) {
-      showError('Network error: ' + e.message);
+      state.lastAutoStartKey = key;
+      clearApiStatus();
+      startTrackingSession(data);
+    } catch (err) {
+      if (requestId !== state.autoStartRequestId) return;
+      clearApiStatus();
+      showError('Network error: ' + err.message);
     }
   }
 
-  btnPrev.addEventListener('click', () => {
-    if (state.times.length === 0 || state.timeIndex <= 0) return;
-    state.timeIndex--;
-    updateSlider();
-    updateTimeLabel();
-    loadFrame();
-  });
-  btnNext.addEventListener('click', () => {
-    const n = state.times.length;
-    if (n === 0 || state.timeIndex >= n - 1) return;
-    state.timeIndex++;
-    updateSlider();
-    updateTimeLabel();
-    loadFrame();
-  });
+  function queueAutoStartSession(force) {
+    if (state.autoStartTimer) {
+      clearTimeout(state.autoStartTimer);
+      state.autoStartTimer = null;
+    }
+    state.autoStartTimer = setTimeout(() => {
+      startStormSessionAutomatically(Boolean(force));
+    }, 350);
+  }
 
-  timeSlider.addEventListener('input', () => {
-    const n = state.times.length;
-    if (n === 0) return;
-    const v = parseInt(timeSlider.value, 10);
-    state.timeIndex = Math.max(0, Math.min(v, n - 1));
+  function updateChartViewport(minUtc, maxUtc) {
+    if (!minUtc || !maxUtc) return;
+    const charts = [state.waterTideChart, state.surgeChart];
+    charts.forEach((chart) => {
+      if (!chart) return;
+      if (chart.options.scales && chart.options.scales.x) {
+        chart.options.scales.x.min = minUtc;
+        chart.options.scales.x.max = maxUtc;
+        chart.update('none');
+      }
+    });
+  }
+
+  function updateCurrentFrameMarker(overrideIso) {
+    let markerIso = overrideIso || null;
+    if (!markerIso && state.times.length) {
+      const current = state.times[state.timeIndex];
+      markerIso = current && current.time_utc ? current.time_utc : null;
+    }
+    if (!markerIso) return;
+    const charts = [state.waterTideChart, state.surgeChart];
+    charts.forEach((chart) => {
+      if (!chart || !chart.options || !chart.options.plugins || !chart.options.plugins.annotation) return;
+      if (!chart.options.plugins.annotation.annotations) {
+        chart.options.plugins.annotation.annotations = {};
+      }
+      chart.options.plugins.annotation.annotations['current-frame-line'] = {
+        type: 'line',
+        xMin: markerIso,
+        xMax: markerIso,
+        borderColor: 'rgba(220, 0, 0, 0.95)',
+        borderWidth: 2,
+        borderDash: [0, 0],
+        label: {
+          display: true,
+          content: 'Current Frame',
+          position: 'start',
+          backgroundColor: 'rgba(255,255,255,0.8)',
+          color: '#222',
+          padding: 2
+        }
+      };
+      chart.update('none');
+    });
+  }
+
+  function destroyWaterCharts() {
+    if (state.waterTideChart) {
+      state.waterTideChart.destroy();
+      state.waterTideChart = null;
+    }
+    if (state.surgeChart) {
+      state.surgeChart.destroy();
+      state.surgeChart = null;
+    }
+  }
+
+  function destroyWindowSlider() {
+    if (timeWindowSliderEl && timeWindowSliderEl.noUiSlider) {
+      timeWindowSliderEl.noUiSlider.destroy();
+    }
+  }
+
+  function renderWaterLevelChart() {
+    destroyWaterCharts();
+    const series = state.waterSeries;
+    const stormWindows = state.stormWindows || [];
+    if (!series.length || typeof Chart === 'undefined') return;
+    const labels = series.map((p) => p.time_utc);
+    const wlData = series.map((p) => p.water_level != null ? p.water_level : NaN);
+    const tideData = series.map((p) => p.tide != null ? p.tide : NaN);
+    const surgeData = series.map((p) => p.surge != null ? p.surge : NaN);
+
+    const wlTideVals = wlData.concat(tideData).filter((v) => v != null && !Number.isNaN(v));
+    const surgeVals = surgeData.filter((v) => v != null && !Number.isNaN(v));
+
+    const wlTideMin = wlTideVals.length ? Math.min(...wlTideVals) - 0.3 : -0.5;
+    const wlTideMax = wlTideVals.length ? Math.max(...wlTideVals) + 0.3 : 4;
+    const surgeMin = surgeVals.length ? Math.min(...surgeVals) - 0.1 : -0.5;
+    const surgeMax = surgeVals.length ? Math.max(...surgeVals) + 0.1 : 4;
+
+    const waterAnnotations = {};
+    const defaultWindows = computeDefaultWindows(series);
+    const startIso = state.plotStartUtc || (defaultWindows && defaultWindows.mainStartUtc) || (series[0] && series[0].time_utc);
+    const endIso = state.plotEndUtc || (defaultWindows && defaultWindows.mainEndUtc) || (series[series.length - 1] && series[series.length - 1].time_utc);
+    const currentPoint = state.times[state.timeIndex];
+    const markerIso = currentPoint && currentPoint.time_utc ? currentPoint.time_utc : (startIso || endIso);
+    const addLine = function (target, key, xIso, color, labelText, withLabel) {
+      if (!xIso) return;
+      target[key] = {
+        type: 'line',
+        xMin: xIso,
+        xMax: xIso,
+        borderColor: color,
+        borderWidth: 2,
+        borderDash: [0, 0],
+        label: withLabel ? {
+          display: true,
+          content: labelText,
+          position: 'start',
+          backgroundColor: 'rgba(255,255,255,0.8)',
+          color: '#222',
+          padding: 2,
+          yAdjust: 0
+        } : {
+          display: false
+        }
+      };
+    };
+    const era5Start = state.candidateEra5StartUtc || state.era5StartUtc || startIso;
+    const era5End = state.candidateEra5EndUtc || state.era5EndUtc || endIso;
+    addLine(waterAnnotations, 'era5-start-line', era5Start, 'rgba(0, 120, 200, 0.9)', 'ERA5 Start', false);
+    addLine(waterAnnotations, 'era5-end-line', era5End, 'rgba(0, 120, 200, 0.9)', 'ERA5 End', false);
+    stormWindows.forEach(function (win, i) {
+      const box = {
+        type: 'box',
+        xMin: win.start_utc,
+        xMax: win.end_utc,
+        yMin: Number.NEGATIVE_INFINITY,
+        yMax: Number.POSITIVE_INFINITY,
+        backgroundColor: 'rgba(200, 100, 180, 0.15)',
+        borderColor: 'rgba(200, 100, 180, 0.5)',
+        borderWidth: 1
+      };
+      waterAnnotations['storm-window-' + i] = box;
+    });
+    if (markerIso) {
+      const markerAnn = {
+        type: 'line',
+        xMin: markerIso,
+        xMax: markerIso,
+        borderColor: 'rgba(220, 0, 0, 0.95)',
+        borderWidth: 2,
+        borderDash: [0, 0],
+        label: {
+          display: true,
+          content: 'Current Frame',
+          position: 'start',
+          backgroundColor: 'rgba(255,255,255,0.8)',
+          color: '#222',
+          padding: 2
+        }
+      };
+      waterAnnotations['current-frame-line'] = markerAnn;
+    }
+    const waterCtx = waterTideChartCanvas.getContext('2d');
+    const yMin = Math.min(wlTideMin, surgeMin);
+    const yMax = Math.max(wlTideMax, surgeMax);
+
+    state.waterTideChart = new Chart(waterCtx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: 'Water level (m)', data: wlData, borderColor: '#1e88e5', backgroundColor: 'rgba(30, 136, 229, 0.1)', fill: false, tension: 0.1, pointRadius: 0 },
+          { label: 'Predicted tide (m)', data: tideData, borderColor: '#e53935', backgroundColor: 'rgba(229, 57, 53, 0.08)', fill: false, tension: 0.1, pointRadius: 0 },
+          { label: 'Surge (m)', data: surgeData, borderColor: '#ff6728', backgroundColor: 'rgba(255, 103, 40, 0.1)', fill: false, tension: 0.1, pointRadius: 0, hidden: true }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        aspectRatio: 1.5,
+        interaction: { intersect: false, mode: 'index' },
+        scales: {
+          x: {
+            type: 'time',
+            time: { unit: 'hour', displayFormats: { hour: 'HH:mm', day: 'MMM d', month: 'MMM yyyy' } },
+            title: { display: true, text: 'Time (UTC)' },
+            min: startIso,
+            max: endIso,
+            ticks: {
+              display: true,
+              source: 'data',
+              callback: function (value) {
+                const d = new Date(value);
+                if (Number.isNaN(d.getTime())) return '';
+                const pad = (n) => String(n).padStart(2, '0');
+                const hours = d.getUTCHours();
+                const minutes = d.getUTCMinutes();
+                if (hours === 0 && minutes === 0) {
+                  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                  return `${months[d.getUTCMonth()]} ${d.getUTCDate()} 00:00`;
+                }
+                return `${pad(hours)}:${pad(minutes)}`;
+              }
+            }
+          },
+          y: {
+            title: { display: true, text: 'm' },
+            min: yMin,
+            max: yMax
+          }
+        },
+        plugins: {
+          legend: { display: true },
+          annotation: {
+            annotations: waterAnnotations
+          },
+          tooltip: {
+            callbacks: {
+              label: function (item) {
+                const raw = item.raw;
+                const str = (raw != null && !Number.isNaN(raw)) ? raw.toFixed(3) : '—';
+                return item.dataset.label + ': ' + str;
+              }
+            }
+          }
+        }
+      }
+    });
+    updateCurrentFrameMarker(markerIso);
+  }
+
+  function startTrackingSession(data) {
+    state.sessionId = data.session_id;
+    state.times = data.times || [];
+    state.bounds = data.bounds || {};
+    state.activeStartIdx = 0;
+    state.activeEndIdx = Math.max(0, state.times.length - 1);
+    state.timeIndex = state.activeStartIdx;
+    // Set ERA5 window (slider outer handles) from 24h before/after barrier when available.
+    const era5StartMs = state.era5StartUtc ? new Date(state.era5StartUtc).getTime() : NaN;
+    const era5EndMs = state.era5EndUtc ? new Date(state.era5EndUtc).getTime() : NaN;
+    if (Number.isFinite(era5StartMs) && Number.isFinite(era5EndMs)) {
+      const sessionStartIdx = nearestStartIndexForTimeMs(era5StartMs);
+      const sessionEndIdx = nearestEndIndexForTimeMs(era5EndMs);
+      state.activeStartIdx = Math.max(0, Math.min(sessionStartIdx, state.times.length - 1));
+      state.activeEndIdx = Math.max(state.activeStartIdx, Math.min(sessionEndIdx, state.times.length - 1));
+    } else {
+      const startMs = startUtcInput.value ? new Date(startUtcInput.value).getTime() : NaN;
+      const endMs = endUtcInput.value ? new Date(endUtcInput.value).getTime() : NaN;
+      if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+        const sessionStartIdx = nearestStartIndexForTimeMs(startMs);
+        const sessionEndIdx = nearestEndIndexForTimeMs(endMs);
+        state.activeStartIdx = Math.max(0, Math.min(sessionStartIdx, state.times.length - 1));
+        state.activeEndIdx = Math.max(state.activeStartIdx, Math.min(sessionEndIdx, state.times.length - 1));
+      }
+    }
+    const currentAnchorIso = state.barrierEndUtc || state.defaultCurrentUtc;
+    const currentMs = currentAnchorIso ? new Date(currentAnchorIso).getTime() : NaN;
+    if (Number.isFinite(currentMs)) {
+      let mappedCurrent = nearestIndexInRangeForTimeMs(
+        currentMs,
+        state.activeStartIdx,
+        state.activeEndIdx
+      );
+      mappedCurrent = Math.max(state.activeStartIdx, Math.min(mappedCurrent, state.activeEndIdx));
+      state.timeIndex = mappedCurrent;
+    } else {
+      state.timeIndex = state.activeStartIdx;
+    }
+    // Keep first-load state exactly aligned with committed ERA5 defaults.
+    state.candidateEra5StartUtc = state.era5StartUtc;
+    state.candidateEra5EndUtc = state.era5EndUtc;
+    setEra5UpdateButtonDirty(false);
+    state.track = [];
+    mapSection.hidden = false;
+    if (gifSection) {
+      gifSection.hidden = false;
+    }
+    clearGifPreview();
+    updateSlider();
+    refreshEra5CandidateFromSlider();
     updateTimeLabel();
+    updateFrameWindowStatus();
+    updateCurrentFrameMarker();
+    updateTrackInfo();
+    updateDownloadLink();
     loadFrame();
-  });
+    fetchTrack();
+  }
+
+  async function loadStormCatalog() {
+    try {
+      const res = await fetch(`${API}/api/storms`);
+      if (!res.ok) {
+        throw new Error('Failed to load storms');
+      }
+      const data = await res.json();
+      state.storms = data.storms || [];
+      stormSelect.innerHTML = '';
+      state.storms.forEach((s) => {
+        const opt = document.createElement('option');
+        opt.value = String(s.storm_id);
+        opt.textContent = `${s.storm_id}. ${s.label}`;
+        stormSelect.appendChild(opt);
+      });
+      if (state.storms.length > 0) {
+        state.selectedStormId = state.storms[0].storm_id;
+        stormSelect.value = String(state.selectedStormId);
+        updateStormDetails();
+      }
+    } catch (e) {
+      showError('Could not load storm list: ' + e.message);
+    }
+  }
+
+  function updateStormDetails() {
+    const sid = Number(stormSelect.value);
+    const s = state.storms.find((st) => Number(st.storm_id) === sid);
+    state.selectedStormId = sid;
+    if (!s) return;
+    let hoursText = '';
+    if (s.storm_start_local && s.storm_end_local) {
+      const start = new Date(s.storm_start_local.replace(' ', 'T') + 'Z');
+      const end = new Date(s.storm_end_local.replace(' ', 'T') + 'Z');
+      if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime()) && end > start) {
+        const diffHours = (end.getTime() - start.getTime()) / 3600000;
+        const rounded = Math.round(diffHours * 10) / 10;
+        hoursText = ` (${rounded} h)`;
+      }
+    }
+    stormMeta.innerHTML = `
+      <div><strong>Barrier closed (local):</strong> ${s.storm_end_local}${hoursText}</div>
+    `;
+    waterLevelPlaceholder.hidden = false;
+    if (waterLevelLoading) waterLevelLoading.hidden = true;
+    if (waterLevelError) { waterLevelError.hidden = true; waterLevelError.textContent = ''; }
+    waterLevelChartWrap.hidden = true;
+    era5WindowSection.hidden = true;
+    mapSection.hidden = true;
+    if (gifSection) gifSection.hidden = true;
+    destroyWaterCharts();
+    destroyWindowSlider();
+    state.sessionId = null;
+    state.times = [];
+    state.activeStartIdx = 0;
+    state.activeEndIdx = 0;
+    state.barrierStartUtc = null;
+    state.barrierEndUtc = null;
+    state.defaultCurrentUtc = null;
+    state.plotStartUtc = null;
+    state.plotEndUtc = null;
+    state.timeIndex = 0;
+    state.track = [];
+    state.lastAutoStartKey = null;
+    state.waterSeries = [];
+    state.stormWindows = [];
+    state.era5StartUtc = null;
+    state.era5EndUtc = null;
+    state.candidateEra5StartUtc = null;
+    state.candidateEra5EndUtc = null;
+    startUtcInput.value = '';
+    endUtcInput.value = '';
+    setEra5UpdateButtonDirty(false);
+    if (activeFirstFrameEl) activeFirstFrameEl.textContent = '—';
+    if (activeCurrentFrameEl) activeCurrentFrameEl.textContent = '—';
+    if (activeLastFrameEl) activeLastFrameEl.textContent = '—';
+    if (activeFrameCountEl) activeFrameCountEl.textContent = '0';
+
+    const hasSeries = s.has_water_level_series !== false;
+    if (!hasSeries) {
+      waterLevelPlaceholder.textContent = 'No water level series for this storm.';
+      return;
+    }
+    waterLevelPlaceholder.hidden = true;
+    loadWaterLevelSeries(sid);
+  }
+
+  function loadWaterLevelSeries(sid) {
+    if (!sid) return;
+    destroyWaterCharts();
+    destroyWindowSlider();
+    state.waterSeries = [];
+    if (waterLevelLoading) waterLevelLoading.hidden = false;
+    if (waterLevelError) waterLevelError.hidden = true;
+    const url = `${API}/api/storms/${sid}/water_level_series`;
+    fetch(url)
+      .then(function (res) {
+        if (waterLevelLoading) waterLevelLoading.hidden = true;
+        if (!res.ok) throw new Error('Could not load series');
+        return res.json();
+      })
+      .then(function (data) {
+        const series = data.series || [];
+        state.waterSeries = series;
+        state.stormWindows = data.storm_windows || [];
+        if (series.length === 0) {
+          if (waterLevelError) { waterLevelError.textContent = 'No water level data in window.'; waterLevelError.hidden = false; }
+          return;
+        }
+        waterLevelChartWrap.hidden = false;
+        era5WindowSection.hidden = false;
+        const barrier = computeBarrierBounds();
+        if (barrier) {
+          state.barrierStartUtc = barrier.startUtc;
+          state.barrierEndUtc = barrier.endUtc;
+          state.defaultCurrentUtc = barrier.endUtc;
+        } else {
+          state.barrierStartUtc = null;
+          state.barrierEndUtc = null;
+          state.defaultCurrentUtc = null;
+        }
+        const defaults = computeDefaultWindows(series);
+        if (defaults) {
+          state.plotStartUtc = defaults.mainStartUtc;
+          state.plotEndUtc = defaults.mainEndUtc;
+          // ERA5 window defaults to 24h before/after barrier.
+          state.era5StartUtc = defaults.era5StartUtc;
+          state.era5EndUtc = defaults.era5EndUtc;
+          setEra5Window(defaults.era5StartUtc, defaults.era5EndUtc);
+          state.candidateEra5StartUtc = defaults.era5StartUtc;
+          state.candidateEra5EndUtc = defaults.era5EndUtc;
+          setEra5UpdateButtonDirty(false);
+          updateChartViewport(state.plotStartUtc, state.plotEndUtc);
+        } else {
+          setEra5Window('', '');
+          setEra5UpdateButtonDirty(false);
+        }
+        renderWaterLevelChart();
+        queueAutoStartSession(true);
+      })
+      .catch(function (e) {
+        if (waterLevelLoading) waterLevelLoading.hidden = true;
+        if (waterLevelError) { waterLevelError.textContent = e.message || 'Error loading series'; waterLevelError.hidden = false; }
+      });
+  }
+
+  if (btnGenerateGif) {
+    btnGenerateGif.addEventListener('click', () => {
+      generateGif();
+    });
+  }
 
   document.querySelectorAll('input[name="mode"]').forEach((radio) => {
     radio.addEventListener('change', () => { state.mode = radio.value; });
@@ -235,7 +1109,6 @@
 
   clickLayer.addEventListener('click', (e) => {
     if (!state.sessionId || !state.bounds) return;
-    const rect = clickLayer.getBoundingClientRect();
     const x = e.clientX;
     const y = e.clientY;
     const pt = pixelToLonLat(x, y);
@@ -257,4 +1130,64 @@
     clickLayer.style.width = '100%';
     clickLayer.style.height = 'auto';
   });
+  stormSelect.addEventListener('change', () => {
+    updateStormDetails();
+  });
+
+  btnSaveCombined.addEventListener('click', async () => {
+    if (!state.sessionId || state.track.length === 0) return;
+    try {
+      btnSaveCombined.disabled = true;
+      const res = await fetch(`${API}/api/combined/save/${state.sessionId}`, {
+        method: 'POST'
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showError(data.detail || 'Failed to save combined CSV');
+        return;
+      }
+    } catch (e) {
+      showError('Network error: ' + e.message);
+    } finally {
+      updateTrackInfo();
+    }
+  });
+
+  if (btnEra5Reset) {
+    btnEra5Reset.addEventListener('click', () => {
+      if (!state.waterSeries.length) return;
+      const defaults = computeDefaultWindows(state.waterSeries);
+      if (!defaults) return;
+      state.era5StartUtc = defaults.era5StartUtc;
+      state.era5EndUtc = defaults.era5EndUtc;
+      setEra5Window(defaults.era5StartUtc, defaults.era5EndUtc);
+      if (state.times.length) {
+        const startIdx = nearestStartIndexForTimeMs(new Date(defaults.era5StartUtc).getTime());
+        const endIdx = nearestEndIndexForTimeMs(new Date(defaults.era5EndUtc).getTime());
+        setActiveWindowIndices(startIdx, endIdx, { reloadFrame: false });
+      } else {
+        updateChartViewport(defaults.mainStartUtc, defaults.mainEndUtc);
+      }
+      setEra5UpdateButtonDirty(false);
+      renderWaterLevelChart();
+      syncSessionToEra5Window();
+    });
+  }
+  if (btnEra5Update) {
+    btnEra5Update.addEventListener('click', () => {
+      if (btnEra5Update.disabled) return;
+      const startIso = state.candidateEra5StartUtc || state.era5StartUtc;
+      const endIso = state.candidateEra5EndUtc || state.era5EndUtc;
+      if (!startIso || !endIso) return;
+      state.era5StartUtc = startIso;
+      state.era5EndUtc = endIso;
+      setEra5Window(startIso, endIso);
+      setEra5UpdateButtonDirty(false);
+      renderWaterLevelChart();
+      syncSessionToEra5Window();
+    });
+  }
+
+  setEra5UpdateButtonDirty(false);
+  loadStormCatalog();
 })();

@@ -2,6 +2,16 @@
 
 Upload ERA5 NetCDF files, step through time to view pressure and wind, click on the map to digitize the storm track (like `master1.m` / `correct_storm_tracks.py`), and download the track as CSV.
 
+## Storm catalog and ERA5 window
+
+When the app is run from the FLOOD-CDT repo (with `Objective1/3a_ANALYSIS_Python/output/mast1.pkl` and water-level analysis available):
+
+1. **Choose storm** — Select a storm from the dropdown (catalog comes from `mast1.pkl`).
+2. **Water level and surge** — A scrollable time-series chart shows the full water level and surge for the storm. Storm closure windows are drawn as shaded regions. A **single dual-handle slider** (start and end) lets you narrow the ERA5 download window; the chart view zooms to the selected range and the displayed start/end times (UTC) are sent to the CDS ERA5 request when you click "Download ERA5 & start labeling".
+3. **Download ERA5 & start labeling** — Starts a session for the selected storm and time window (or upload an existing `.nc` file instead).
+
+The ERA5 window is set by the dual-handle slider; the chart viewport and the request to `POST /api/storm/start-session` both use the selected `start_utc` and `end_utc`.
+
 ## Run locally
 
 ```bash
@@ -25,6 +35,10 @@ Optional: add `railway.toml` in the same directory (included) to pin the start c
 
 ## API
 
+- `GET /api/storms` — Storm catalog (from mast1.pkl) with default ERA5 windows and `has_water_level_series`.
+- `GET /api/storms/<storm_id>/water_level_series` — Full water-level and surge time series (hourly) for the storm; includes `series`, `full_series_start_utc`, `full_series_end_utc`, `default_start_utc`, `default_end_utc`, and `storm_windows` (closure ranges in UTC for chart shading).
+- `GET /api/storms/<storm_id>/water_level` — Pre-generated water-level plot PNG (if present).
+- `POST /api/storm/start-session` — JSON `{ storm_id, start_utc, end_utc }` → download (or reuse) ERA5 NetCDF and return `{ session_id, times, bounds }`.
 - `POST /api/upload` — multipart `.nc` file → `{ session_id, times, bounds }`
 - `GET /api/frame/<session_id>/<time_index>` — PNG image for that time step
 - `POST /api/track/add` — JSON `{ session_id, time_index, lon, lat }` → append point (pressure interpolated)
