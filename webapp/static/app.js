@@ -27,9 +27,9 @@
     plotStartUtc: null,
     plotEndUtc: null,
     sliderInternalUpdate: false,
-    autoStartTimer: null,
     lastAutoStartKey: null,
-    autoStartRequestId: 0
+    autoStartRequestId: 0,
+    gtsmAvailable: false
   };
 
   const stormSelect = document.getElementById('storm-select');
@@ -38,6 +38,7 @@
   const waterLevelLoading = document.getElementById('water-level-loading');
   const waterLevelError = document.getElementById('water-level-error');
   const waterLevelChartWrap = document.getElementById('water-level-chart-wrap');
+  const chartRangeSection = document.getElementById('chart-range-section');
   const waterTideChartCanvas = document.getElementById('water-tide-chart');
   const surgeChartCanvas = document.getElementById('surge-chart');
   const era5WindowSection = document.getElementById('era5-window-section');
@@ -56,19 +57,13 @@
   const apiStatus = document.getElementById('api-status');
   const mapSection = document.getElementById('map-section');
   const frameImg = document.getElementById('frame-img');
+  const gtsmFrameImg = document.getElementById('gtsm-frame-img');
   const clickLayer = document.getElementById('click-layer');
   const timeWindowSliderEl = document.getElementById('time-window-slider');
   const btnDownload = document.getElementById('btn-download');
   const btnSaveCombined = document.getElementById('btn-save-combined');
   const btnDownloadCombined = document.getElementById('btn-download-combined');
   const trackInfo = document.getElementById('track-info');
-  const gifSection = document.getElementById('gif-section');
-  const btnGenerateGif = document.getElementById('btn-generate-gif');
-  const btnDownloadGif = document.getElementById('btn-download-gif');
-  const gifStatus = document.getElementById('gif-status');
-  const gifPreviewWrap = document.getElementById('gif-preview-wrap');
-  const gifImg = document.getElementById('era5-gif');
-
   function showError(msg) {
     uploadError.textContent = msg;
     uploadError.hidden = false;
@@ -130,7 +125,8 @@
     const m = String(d.getUTCMonth() + 1).padStart(2, '0');
     const day = String(d.getUTCDate()).padStart(2, '0');
     const h = String(d.getUTCHours()).padStart(2, '0');
-    return `${y}-${m}-${day}T${h}:00`;
+    const min = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${y}-${m}-${day}T${h}:${min}`;
   }
 
   function localInputValueToIso(value) {
@@ -160,20 +156,15 @@
 
   function populateChartRangeControls() {
     if (!chartRangeStartSelect || !chartRangeEndSelect) return;
-    chartRangeStartSelect.innerHTML = '';
-    chartRangeEndSelect.innerHTML = '';
-    state.waterSeries.forEach((point) => {
-      if (!point.time_utc) return;
-      const label = formatIsoForCompactUtc(point.time_utc);
-      const startOpt = document.createElement('option');
-      startOpt.value = point.time_utc;
-      startOpt.textContent = label;
-      const endOpt = document.createElement('option');
-      endOpt.value = point.time_utc;
-      endOpt.textContent = label;
-      chartRangeStartSelect.appendChild(startOpt);
-      chartRangeEndSelect.appendChild(endOpt);
-    });
+    if (!state.waterSeries.length) {
+      chartRangeStartSelect.value = '';
+      chartRangeEndSelect.value = '';
+      return;
+    }
+    const startIso = state.plotStartUtc || state.waterSeries[0].time_utc;
+    const endIso = state.plotEndUtc || state.waterSeries[state.waterSeries.length - 1].time_utc;
+    chartRangeStartSelect.value = isoToLocalInputValue(startIso);
+    chartRangeEndSelect.value = isoToLocalInputValue(endIso);
   }
 
   function applyChartRange(startIso, endIso) {
@@ -187,8 +178,8 @@
     }
     state.plotStartUtc = nextStart;
     state.plotEndUtc = nextEnd;
-    if (chartRangeStartSelect) chartRangeStartSelect.value = nextStart;
-    if (chartRangeEndSelect) chartRangeEndSelect.value = nextEnd;
+    if (chartRangeStartSelect) chartRangeStartSelect.value = isoToLocalInputValue(nextStart);
+    if (chartRangeEndSelect) chartRangeEndSelect.value = isoToLocalInputValue(nextEnd);
     updateChartViewport(nextStart, nextEnd);
   }
 
@@ -273,12 +264,6 @@
       ? 'No track points. Click on map in "Add point" mode to add.'
       : `${n} track point(s). Save to combined CSV when done.`;
     btnSaveCombined.disabled = !state.sessionId || n === 0;
-    if (btnGenerateGif) {
-      btnGenerateGif.disabled = !state.sessionId || n === 0;
-    }
-    if (btnDownloadGif) {
-      btnDownloadGif.disabled = !state.sessionId || n === 0;
-    }
   }
 
   function updateDownloadLink() {
@@ -291,84 +276,18 @@
     btnDownload.style.visibility = 'visible';
   }
 
-  function clearGifPreview() {
-    if (gifImg) {
-      gifImg.src = '';
-    }
-    if (gifPreviewWrap) {
-      gifPreviewWrap.hidden = true;
-    }
-    if (gifStatus) {
-      gifStatus.textContent = '';
-      gifStatus.hidden = true;
-    }
-    if (btnDownloadGif) {
-      btnDownloadGif.disabled = true;
-    }
-  }
-
-  function showGifStatus(msg) {
-    if (!gifStatus) return;
-    gifStatus.textContent = msg;
-    gifStatus.hidden = !msg;
-  }
-
-  async function generateGif() {
-    if (!state.sessionId || !state.track.length || !btnGenerateGif) return;
-    try {
-      btnGenerateGif.disabled = true;
-      showGifStatus('Generating ERA5 GIF…');
-      clearError();
-      const url = `${API}/api/gif/era5/${state.sessionId}`;
-      // Use a cache-busting query param so updated GIFs reload
-      const gifUrl = `${url}?t=${Date.now()}`;
-      if (gifImg && gifPreviewWrap) {
-        gifImg.onload = function () {
-          showGifStatus('');
-        };
-        gifImg.onerror = function () {
-          showGifStatus('Failed to load ERA5 GIF.');
-        };
-        gifImg.src = gifUrl;
-        gifPreviewWrap.hidden = false;
-      } else {
-        // Fallback: open in new tab
-        window.open(gifUrl, '_blank');
-        showGifStatus('');
-      }
-    } catch (e) {
-      showGifStatus('Error generating ERA5 GIF: ' + e.message);
-    } finally {
-      if (btnGenerateGif) {
-        btnGenerateGif.disabled = !state.sessionId || !state.track.length;
-      }
-    }
-  }
-
-  async function downloadGif() {
-    if (!state.sessionId || !state.track.length) return;
-    const url = `${API}/api/gif/era5/${state.sessionId}`;
-    const filename = `era5_storm_${state.selectedStormId != null ? state.selectedStormId : state.sessionId}.gif`;
-    try {
-      showGifStatus('Preparing download…');
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(res.statusText);
-      const blob = await res.blob();
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(a.href);
-      showGifStatus('');
-    } catch (e) {
-      showGifStatus('Download failed: ' + e.message);
-    }
-  }
-
   function loadFrame() {
     if (!state.sessionId) return;
     const url = `${API}/api/frame/${state.sessionId}/${state.timeIndex}`;
     frameImg.src = url + '?t=' + Date.now();
+    if (gtsmFrameImg) {
+      if (state.gtsmAvailable) {
+        const gtsmUrl = `${API}/api/gtsm/frame/${state.sessionId}/${state.timeIndex}`;
+        gtsmFrameImg.src = gtsmUrl + '?t=' + Date.now();
+      } else {
+        gtsmFrameImg.removeAttribute('src');
+      }
+    }
   }
 
   async function fetchTrack() {
@@ -549,8 +468,30 @@
     const pendingEndIso = localInputValueToIso(era5EndInput ? era5EndInput.value : '');
     const committedStartIso = state.era5StartUtc || null;
     const committedEndIso = state.era5EndUtc || null;
-    const isDirty = pendingStartIso !== committedStartIso || pendingEndIso !== committedEndIso;
+
+    const isoToMillis = function (iso) {
+      if (!iso) return null;
+      const ms = new Date(iso).getTime();
+      return Number.isFinite(ms) ? ms : null;
+    };
+
+    // Compare normalized timestamps so formatting differences
+    // (e.g. with/without milliseconds) don't mark the button dirty.
+    const pendingStartMs = isoToMillis(pendingStartIso);
+    const pendingEndMs = isoToMillis(pendingEndIso);
+    const committedStartMs = isoToMillis(committedStartIso);
+    const committedEndMs = isoToMillis(committedEndIso);
+    const isDirty = pendingStartMs !== committedStartMs || pendingEndMs !== committedEndMs;
     btnEra5Apply.classList.toggle('era5-apply-dirty', isDirty);
+  }
+
+  function previewEra5WindowLinesFromInputs() {
+    const pendingStartIso = localInputValueToIso(era5StartInput ? era5StartInput.value : '');
+    const pendingEndIso = localInputValueToIso(era5EndInput ? era5EndInput.value : '');
+    updateEra5LineAnnotations(
+      pendingStartIso || state.era5StartUtc,
+      pendingEndIso || state.era5EndUtc
+    );
   }
 
   function commitEra5Window(startIso, endIso) {
@@ -567,86 +508,6 @@
     if (!startIso || !endIso) return;
     showApiStatus('Updating ERA5 window: downloading data…');
     startStormSessionAutomatically(true);
-  }
-
-  function computeDefaultWindows(series) {
-    const barrier = computeBarrierBounds();
-    const seriesStartIso = series[0] && series[0].time_utc;
-    const seriesEndIso = series[series.length - 1] && series[series.length - 1].time_utc;
-    const msPerHour = 3600000;
-
-    function toMs(iso) {
-      const d = new Date(iso);
-      return Number.isNaN(d.getTime()) ? NaN : d.getTime();
-    }
-
-    let mainStartMs;
-    let mainEndMs;
-    let era5StartMs;
-    let era5EndMs;
-
-    if (barrier) {
-      const startMs = toMs(barrier.startUtc);
-      const endMs = toMs(barrier.endUtc);
-      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
-        return null;
-      }
-      mainStartMs = startMs - 62 * msPerHour;
-      mainEndMs = endMs + 62 * msPerHour;
-      era5StartMs = startMs - 24 * msPerHour;
-      era5EndMs = endMs + 24 * msPerHour;
-    } else {
-      // Fallback: center on max surge time, otherwise midpoint of series
-      let centerMs = NaN;
-      if (series && series.length) {
-        let maxSurge = -Infinity;
-        let maxSurgeMs = NaN;
-        series.forEach((p) => {
-          if (p.surge != null && !Number.isNaN(p.surge)) {
-            const tMs = toMs(p.time_utc);
-            if (Number.isFinite(tMs) && p.surge > maxSurge) {
-              maxSurge = p.surge;
-              maxSurgeMs = tMs;
-            }
-          }
-        });
-        if (Number.isFinite(maxSurgeMs)) {
-          centerMs = maxSurgeMs;
-        } else {
-          const startMs = toMs(seriesStartIso);
-          const endMs = toMs(seriesEndIso);
-          if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
-            centerMs = startMs + (endMs - startMs) / 2;
-          }
-        }
-      }
-      if (!Number.isFinite(centerMs)) {
-        return null;
-      }
-      mainStartMs = centerMs - 62 * msPerHour;
-      mainEndMs = centerMs + 62 * msPerHour;
-      era5StartMs = centerMs - 24 * msPerHour;
-      era5EndMs = centerMs + 24 * msPerHour;
-    }
-
-    const clampToSeries = (ms) => {
-      const startMs = toMs(seriesStartIso);
-      const endMs = toMs(seriesEndIso);
-      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return ms;
-      return Math.min(Math.max(ms, startMs), endMs);
-    };
-
-    mainStartMs = clampToSeries(mainStartMs);
-    mainEndMs = clampToSeries(mainEndMs);
-    era5StartMs = clampToSeries(era5StartMs);
-    era5EndMs = clampToSeries(era5EndMs);
-
-    return {
-      mainStartUtc: new Date(mainStartMs).toISOString(),
-      mainEndUtc: new Date(mainEndMs).toISOString(),
-      era5StartUtc: new Date(era5StartMs).toISOString(),
-      era5EndUtc: new Date(era5EndMs).toISOString()
-    };
   }
 
   async function startStormSessionAutomatically(force) {
@@ -688,16 +549,6 @@
       clearApiStatus();
       showError('Network error: ' + err.message);
     }
-  }
-
-  function queueAutoStartSession(force) {
-    if (state.autoStartTimer) {
-      clearTimeout(state.autoStartTimer);
-      state.autoStartTimer = null;
-    }
-    state.autoStartTimer = setTimeout(() => {
-      startStormSessionAutomatically(Boolean(force));
-    }, 350);
   }
 
   function updateChartViewport(minUtc, maxUtc) {
@@ -782,11 +633,10 @@
     const surgeMax = surgeVals.length ? Math.max(...surgeVals) + 0.1 : 4;
 
     const waterAnnotations = {};
-    const defaultWindows = computeDefaultWindows(series);
-    const startIso = state.plotStartUtc || (defaultWindows && defaultWindows.mainStartUtc) || (series[0] && series[0].time_utc);
-    const endIso = state.plotEndUtc || (defaultWindows && defaultWindows.mainEndUtc) || (series[series.length - 1] && series[series.length - 1].time_utc);
+    const startIso = state.plotStartUtc || (series[0] && series[0].time_utc);
+    const endIso = state.plotEndUtc || (series[series.length - 1] && series[series.length - 1].time_utc);
     const currentPoint = state.times[state.timeIndex];
-    const markerIso = currentPoint && currentPoint.time_utc ? currentPoint.time_utc : (startIso || endIso);
+    const markerIso = currentPoint && currentPoint.time_utc ? currentPoint.time_utc : null;
     const addLine = function (target, key, xIso, color, labelText, withLabel) {
       if (!xIso) return;
       target[key] = {
@@ -811,8 +661,8 @@
     };
     const era5Start = state.era5StartUtc;
     const era5End = state.era5EndUtc;
-    addLine(waterAnnotations, 'era5-start-line', era5Start, 'rgba(0, 120, 200, 0.9)', 'ERA5 Start', false);
-    addLine(waterAnnotations, 'era5-end-line', era5End, 'rgba(0, 120, 200, 0.9)', 'ERA5 End', false);
+    addLine(waterAnnotations, 'era5-start-line', era5Start, 'rgba(0, 0, 0, 0.95)', 'ERA5 Start', false);
+    addLine(waterAnnotations, 'era5-end-line', era5End, 'rgba(0, 0, 0, 0.95)', 'ERA5 End', false);
     stormWindows.forEach(function (win, i) {
       const box = {
         type: 'box',
@@ -918,6 +768,7 @@
     state.sessionId = data.session_id;
     state.times = data.times || [];
     state.bounds = data.bounds || {};
+    state.gtsmAvailable = !!data.gtsm_available;
     state.activeStartIdx = 0;
     state.activeEndIdx = Math.max(0, state.times.length - 1);
     state.timeIndex = state.activeStartIdx;
@@ -936,10 +787,6 @@
     }
     state.track = [];
     mapSection.hidden = false;
-    if (gifSection) {
-      gifSection.hidden = false;
-    }
-    clearGifPreview();
     updateSlider();
     updateTimeLabel();
     updateFrameWindowStatus();
@@ -982,8 +829,8 @@
     if (!s) return;
     let hoursText = '';
     if (s.storm_start_local && s.storm_end_local) {
-      const start = new Date(s.storm_start_local.replace(' ', 'T') + 'Z');
-      const end = new Date(s.storm_end_local.replace(' ', 'T') + 'Z');
+      const start = new Date(s.storm_start_local);
+      const end = new Date(s.storm_end_local);
       if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime()) && end > start) {
         const diffHours = (end.getTime() - start.getTime()) / 3600000;
         const rounded = Math.round(diffHours * 10) / 10;
@@ -991,15 +838,16 @@
       }
     }
     stormMeta.innerHTML = `
-      <div><strong>Barrier closed (local):</strong> ${s.storm_end_local}${hoursText}</div>
+      <div><strong>Storm:</strong> ${s.storm || s.label}</div>
+      <div><strong>Closure window (UTC):</strong> ${formatIsoForDisplay(s.storm_start_local)} - ${formatIsoForDisplay(s.storm_end_local)}${hoursText}</div>
     `;
     waterLevelPlaceholder.hidden = false;
     if (waterLevelLoading) waterLevelLoading.hidden = true;
     if (waterLevelError) { waterLevelError.hidden = true; waterLevelError.textContent = ''; }
     waterLevelChartWrap.hidden = true;
+    if (chartRangeSection) chartRangeSection.hidden = true;
     era5WindowSection.hidden = true;
     mapSection.hidden = true;
-    if (gifSection) gifSection.hidden = true;
     destroyWaterCharts();
     destroyWindowSlider();
     state.sessionId = null;
@@ -1017,8 +865,8 @@
     state.waterSeries = [];
     state.stormWindows = [];
     commitEra5Window('', '');
-    if (chartRangeStartSelect) chartRangeStartSelect.innerHTML = '';
-    if (chartRangeEndSelect) chartRangeEndSelect.innerHTML = '';
+    if (chartRangeStartSelect) chartRangeStartSelect.value = '';
+    if (chartRangeEndSelect) chartRangeEndSelect.value = '';
     if (activeFirstFrameEl) activeFirstFrameEl.textContent = '—';
     if (activeCurrentFrameEl) activeCurrentFrameEl.textContent = '—';
     if (activeLastFrameEl) activeLastFrameEl.textContent = '—';
@@ -1055,6 +903,7 @@
           if (waterLevelError) { waterLevelError.textContent = 'No water level data in window.'; waterLevelError.hidden = false; }
           return;
         }
+        if (chartRangeSection) chartRangeSection.hidden = false;
         waterLevelChartWrap.hidden = false;
         era5WindowSection.hidden = false;
         const barrier = computeBarrierBounds();
@@ -1067,38 +916,39 @@
           state.barrierEndUtc = null;
           state.defaultCurrentUtc = null;
         }
-        const defaults = computeDefaultWindows(series);
-        if (defaults) {
-          // ERA5 window defaults to 24h before/after barrier.
-          commitEra5Window(defaults.era5StartUtc, defaults.era5EndUtc);
-          populateChartRangeControls();
-          applyChartRange(defaults.mainStartUtc, defaults.mainEndUtc);
-        } else {
-          commitEra5Window('', '');
-          populateChartRangeControls();
-          if (series.length) {
-            applyChartRange(series[0].time_utc, series[series.length - 1].time_utc);
+        const seriesStart = series[0].time_utc;
+        const seriesEnd = series[series.length - 1].time_utc;
+        const defaultStart = data.default_start_utc || seriesStart;
+        const defaultEnd = data.default_end_utc || seriesEnd;
+        commitEra5Window(defaultStart, defaultEnd);
+        populateChartRangeControls();
+        // Default chart viewport to closure bounds +/- 62h when closures exist.
+        if (barrier) {
+          const barrierStartMs = new Date(barrier.startUtc).getTime();
+          const barrierEndMs = new Date(barrier.endUtc).getTime();
+          if (Number.isFinite(barrierStartMs) && Number.isFinite(barrierEndMs)) {
+            const hourMs = 3600000;
+            const chartStartIso = new Date(barrierStartMs - 62 * hourMs).toISOString();
+            const chartEndIso = new Date(barrierEndMs + 62 * hourMs).toISOString();
+            applyChartRange(chartStartIso, chartEndIso);
+          } else {
+            applyChartRange(defaultStart, defaultEnd);
           }
+        } else {
+          applyChartRange(defaultStart, defaultEnd);
         }
         renderWaterLevelChart();
         updateEra5LineAnnotations(state.era5StartUtc, state.era5EndUtc);
-        queueAutoStartSession(true);
+        // Auto-render frames only when the exact default window is already cached.
+        if (data.default_window_cached) {
+          showApiStatus('Loading cached ERA5 window…');
+          startStormSessionAutomatically(false);
+        }
       })
       .catch(function (e) {
         if (waterLevelLoading) waterLevelLoading.hidden = true;
         if (waterLevelError) { waterLevelError.textContent = e.message || 'Error loading series'; waterLevelError.hidden = false; }
       });
-  }
-
-  if (btnGenerateGif) {
-    btnGenerateGif.addEventListener('click', () => {
-      generateGif();
-    });
-  }
-  if (btnDownloadGif) {
-    btnDownloadGif.addEventListener('click', () => {
-      downloadGif();
-    });
   }
 
   document.querySelectorAll('input[name="mode"]').forEach((radio) => {
@@ -1154,7 +1004,10 @@
   if (chartRangeStartSelect) {
     chartRangeStartSelect.addEventListener('change', () => {
       if (!chartRangeStartSelect.value || !chartRangeEndSelect || !chartRangeEndSelect.value) return;
-      applyChartRange(chartRangeStartSelect.value, chartRangeEndSelect.value);
+      const startIso = localInputValueToIso(chartRangeStartSelect.value);
+      const endIso = localInputValueToIso(chartRangeEndSelect.value);
+      if (!startIso || !endIso) return;
+      applyChartRange(startIso, endIso);
       renderWaterLevelChart();
     });
   }
@@ -1162,7 +1015,10 @@
   if (chartRangeEndSelect) {
     chartRangeEndSelect.addEventListener('change', () => {
       if (!chartRangeEndSelect.value || !chartRangeStartSelect || !chartRangeStartSelect.value) return;
-      applyChartRange(chartRangeStartSelect.value, chartRangeEndSelect.value);
+      const startIso = localInputValueToIso(chartRangeStartSelect.value);
+      const endIso = localInputValueToIso(chartRangeEndSelect.value);
+      if (!startIso || !endIso) return;
+      applyChartRange(startIso, endIso);
       renderWaterLevelChart();
     });
   }
@@ -1189,8 +1045,14 @@
 
   [era5StartInput, era5EndInput].forEach((inputEl) => {
     if (!inputEl) return;
-    inputEl.addEventListener('input', updateEra5ApplyButtonDirtyState);
-    inputEl.addEventListener('change', updateEra5ApplyButtonDirtyState);
+    inputEl.addEventListener('input', () => {
+      updateEra5ApplyButtonDirtyState();
+      previewEra5WindowLinesFromInputs();
+    });
+    inputEl.addEventListener('change', () => {
+      updateEra5ApplyButtonDirtyState();
+      previewEra5WindowLinesFromInputs();
+    });
   });
 
   updateEra5ApplyButtonDirtyState();

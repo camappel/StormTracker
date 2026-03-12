@@ -2,15 +2,19 @@
 
 Upload ERA5 NetCDF files, step through time to view pressure and wind, click on the map to digitize the storm track (like `master1.m` / `correct_storm_tracks.py`), and download the track as CSV.
 
-## Storm catalog and ERA5 window
+## Storm metadata and data files
 
-When the app is run from the FLOOD-CDT repo (with `Objective1/3a_ANALYSIS_Python/output/mast1.pkl` and water-level analysis available):
+Storm metadata is read from `StormTracker/data/storms.json`.
 
-1. **Choose storm** — Select a storm from the dropdown (catalog comes from `mast1.pkl`).
-2. **Water level and surge** — A scrollable time-series chart shows the full water level and surge for the storm. Storm closure windows are drawn as shaded regions. A **single dual-handle slider** (start and end) lets you narrow the ERA5 download window; the chart view zooms to the selected range and the displayed start/end times (UTC) are sent to the CDS ERA5 request when you click "Download ERA5 & start labeling".
-3. **Download ERA5 & start labeling** — Starts a session for the selected storm and time window (or upload an existing `.nc` file instead).
+Water-level time series are read from `StormTracker/data/water_level_series.json` as a full series source, then filtered per selected storm in the API response.
 
-The ERA5 window is set by the dual-handle slider; the chart viewport and the request to `POST /api/storm/start-session` both use the selected `start_utc` and `end_utc`.
+Helper script:
+
+```bash
+python StormTracker/scripts/bootstrap_storms_metadata.py
+```
+
+This script bootstraps both files from the existing analysis outputs.
 
 ## Run locally
 
@@ -35,15 +39,16 @@ Optional: add `railway.toml` in the same directory (included) to pin the start c
 
 ## API
 
-- `GET /api/storms` — Storm catalog (from mast1.pkl) with default ERA5 windows and `has_water_level_series`.
-- `GET /api/storms/<storm_id>/water_level_series` — Full water-level and surge time series (hourly) for the storm; includes `series`, `full_series_start_utc`, `full_series_end_utc`, `default_start_utc`, `default_end_utc`, and `storm_windows` (closure ranges in UTC for chart shading).
-- `GET /api/storms/<storm_id>/water_level` — Pre-generated water-level plot PNG (if present).
-- `POST /api/storm/start-session` — JSON `{ storm_id, start_utc, end_utc }` → download (or reuse) ERA5 NetCDF and return `{ session_id, times, bounds }`.
+- `GET /api/storms` — Storm catalog loaded from `data/storms.json`.
+- `GET /api/storms/<storm_id>/water_level_series` — Full water-level series for selected storm from `data/water_level_series.json` with `series`, `full_series_start_utc`, `full_series_end_utc`, `default_start_utc`, `default_end_utc`, and `storm_windows`.
+- `POST /api/storm/start-session` — JSON `{ storm_id, start_utc, end_utc }` → reuse local ERA5 if present, otherwise download to `data/era5/`, then return `{ session_id, times, gtsm_available, bounds }`.
 - `POST /api/upload` — multipart `.nc` file → `{ session_id, times, bounds }`
 - `GET /api/frame/<session_id>/<time_index>` — PNG image for that time step
+- `GET /api/gtsm/frame/<session_id>/<time_index>` — GTSM frame PNG for the same timestamp (cached under `data/gtsm/`)
 - `POST /api/track/add` — JSON `{ session_id, time_index, lon, lat }` → append point (pressure interpolated)
 - `POST /api/track/delete` — JSON `{ session_id, time_index }` (or `time_index: -1` to remove last)
 - `GET /api/track/<session_id>` — current track as JSON
 - `GET /api/csv/<session_id>` — CSV attachment: `storm_id`, `time_utc`, `lon`, `lat`, `pressure_hpa`
+- `POST /api/combined/save/<session_id>` — save combined CSV and persist derived `storm_window` (labelled frame span +/- 3h) into `data/storms.json`
 
 Sessions are in-memory; no persistence. Use a single upload per session and download CSV when done.

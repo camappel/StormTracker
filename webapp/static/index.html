@@ -22,6 +22,7 @@
       <div class="storm-layout">
         <div class="storm-detail-panel">
           <h2 class="panel-title">Water levels &amp; ERA5 window</h2>
+          <p class="gauge-label">Tide gauge: Eastern Scheldt (3.68°E, 51.64°N)</p>
           <p class="window-label">Choose storm:</p>
           <select id="storm-select"></select>
           <div id="storm-meta" class="storm-meta"></div>
@@ -29,26 +30,33 @@
             <p id="water-level-placeholder" class="placeholder">Select a storm to load water level and surge time series.</p>
             <p id="water-level-loading" class="loading-message" hidden>Loading series…</p>
             <p id="water-level-error" class="error-message" hidden></p>
-            <div id="era5-window-section" class="era5-window-section" hidden>
+            <div id="chart-range-section" class="era5-window-section" hidden>
               <div class="era5-window-controls">
                 <div class="range-row">
                   <div class="range-field">
                     <label for="chart-range-start">Chart range start (UTC)</label>
-                    <select id="chart-range-start"></select>
+                    <input type="datetime-local" id="chart-range-start" step="3600">
                   </div>
                   <div class="range-field">
                     <label for="chart-range-end">Chart range end (UTC)</label>
-                    <select id="chart-range-end"></select>
+                    <input type="datetime-local" id="chart-range-end" step="3600">
                   </div>
                 </div>
+              </div>
+            </div>
+            <div id="water-level-chart-wrap" class="chart-wrap" hidden>
+              <canvas id="water-tide-chart"></canvas>
+            </div>
+            <div id="era5-window-section" class="era5-window-section" hidden>
+              <div class="era5-window-controls">
                 <div class="range-row">
                   <div class="range-field">
                     <label for="era5-start-input">ERA5 start (UTC)</label>
-                    <input type="datetime-local" id="era5-start-input" step="3600">
+                    <input type="datetime-local" id="era5-start-input" step="60">
                   </div>
                   <div class="range-field">
                     <label for="era5-end-input">ERA5 end (UTC)</label>
-                    <input type="datetime-local" id="era5-end-input" step="3600">
+                    <input type="datetime-local" id="era5-end-input" step="60">
                   </div>
                 </div>
                 <button type="button" id="btn-era5-apply" class="button secondary-button">Apply ERA5 window</button>
@@ -70,9 +78,14 @@
             <div class="time-nav-row">
               <div id="time-window-slider" class="window-range-slider"></div>
             </div>
-            <div class="map-container">
-              <img id="frame-img" alt="Pressure and wind map" />
-              <canvas id="click-layer" aria-hidden="true"></canvas>
+            <div class="frame-stack">
+              <div class="map-container">
+                <img id="frame-img" alt="ERA5 pressure and wind map" />
+                <canvas id="click-layer" aria-hidden="true"></canvas>
+              </div>
+              <div class="map-container gtsm-container">
+                <img id="gtsm-frame-img" alt="GTSM surge frame" />
+              </div>
             </div>
             <p id="track-info"></p>
             <div id="frame-window-status" class="window-labels">
@@ -84,16 +97,6 @@
             <div class="mode-controls">
               <label><input type="radio" name="mode" value="add" checked> Add point</label>
               <label><input type="radio" name="mode" value="delete"> Delete point</label>
-            </div>
-            <div id="gif-section" class="gif-section" hidden>
-              <div class="gif-actions">
-                <button type="button" id="btn-generate-gif" class="button tertiary-button" disabled>Generate ERA5 GIF (labelled window ±3h)</button>
-                <button type="button" id="btn-download-gif" class="button secondary-button" disabled>Download GIF</button>
-                <span id="gif-status" class="gif-status" hidden></span>
-              </div>
-              <div id="gif-preview-wrap" class="gif-preview-wrap" hidden>
-                <img id="era5-gif" alt="ERA5 GIF with labelled track" />
-              </div>
             </div>
             <div class="actions">
               <a id="btn-download" href="#" download="storm_track.csv" class="button" style="visibility: hidden;">Download CSV (this session)</a>
