@@ -46,10 +46,50 @@ header h1 {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
-#storm-select {
+#barrier-filter-select {
   width: 100%;
   padding: 0.3rem 0.4rem;
   font-size: 0.95rem;
+}
+
+.closures-table-wrap {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.closures-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.closures-table th,
+.closures-table td {
+  padding: 0.35rem 0.45rem;
+  border-bottom: 1px solid #eee;
+  text-align: left;
+}
+
+.closures-table thead th {
+  position: sticky;
+  top: 0;
+  background: #f6f6f6;
+  z-index: 1;
+}
+
+.closures-table tbody tr {
+  cursor: pointer;
+}
+
+.closures-table tbody tr:hover {
+  background: #f3f8ff;
+}
+
+.closures-table tbody tr.active {
+  background: #dbeaff;
 }
 
 .storm-meta {
@@ -84,6 +124,17 @@ header h1 {
   display: block;
   max-height: 700px;
   margin-bottom: 0.5rem;
+}
+
+.nao-analysis-section {
+  margin-top: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.nao-analysis-stats {
+  margin: 0.35rem 0 0 0;
+  font-size: 0.88rem;
+  color: #333;
 }
 
 .era5-window-section {

@@ -4,17 +4,27 @@ Upload ERA5 NetCDF files, step through time to view pressure and wind, click on 
 
 ## Storm metadata and data files
 
-Storm metadata is read from `StormTracker/data/storms.json`.
+Canonical storm metadata now lives in `StormTracker/data/storms.json` (master source of truth).
+Each closure entry in the master file includes a `barrier` field (`eastern_scheldt` or `thames`).
 
-Water-level time series are read from `StormTracker/data/water_level_series.json` as a full series source, then filtered per selected storm in the API response.
+For current app compatibility, `StormTracker/data/eastern_scheldt/storms.json` is generated from the master file.
 
-Helper script:
+Water-level time series are read from `StormTracker/data/<dataset>/water_level_series.json` as a flat full-gauge series (no storm IDs). The API slices this series per selected storm using closure bounds +/- 62 hours.
+
+Supported datasets in the UI/API are:
+
+- `eastern_scheldt` (default)
+- `thames_barrier`
+
+Helper scripts:
 
 ```bash
 python StormTracker/scripts/bootstrap_storms_metadata.py
+python StormTracker/scripts/merge_master_storms.py --write
 ```
 
-This script bootstraps both files from the existing analysis outputs.
+- `bootstrap_storms_metadata.py` bootstraps Eastern Scheldt metadata and water-level series from analysis outputs.
+- `merge_master_storms.py --write` builds `data/storms.json` from Eastern Scheldt + Thames storm lists and refreshes the generated Eastern Scheldt compatibility file.
 
 ## Run locally
 
@@ -28,18 +38,26 @@ uvicorn main:app --reload --port 8000
 
 Open http://localhost:8000 — upload a `.nc` file (ERA5 format: `msl`, `u10`, `v10`, `valid_time`, `latitude`, `longitude`), use Prev/Next to step through time, click to add track points (or switch to "Delete point" and click to remove), then click `Update Storm Track` to persist changes.
 
+Startup order in the UI:
+
+1. Load the generated compatibility `storms.json` for the selected dataset.
+2. Default the storm selector to storm `1` (fallback to first available).
+3. Load and render only that storm's sliced water-level window.
+
 ## Configuration (share-ready defaults)
 
-The app now runs from any clone location by default using `StormTracker/data`.
+The app now runs from any clone location by default using `StormTracker/data`, and resolves files from `StormTracker/data/<dataset>/...`.
 You can override storage locations with environment variables:
 
 - `STORMTRACKER_DATA_DIR` (defaults to `StormTracker/data`)
+- `STORMTRACKER_DEFAULT_DATASET` (defaults to `eastern_scheldt`)
 - `STORMTRACKER_CODEC_GTSM_DIRS` (path-separated list of GTSM roots to scan)
 
 Example:
 
 ```bash
 export STORMTRACKER_DATA_DIR="/path/to/shared/data"
+export STORMTRACKER_DEFAULT_DATASET="eastern_scheldt"
 export STORMTRACKER_CODEC_GTSM_DIRS="/mnt/gtsmA:/mnt/gtsmB"
 ```
 
@@ -54,18 +72,18 @@ Optional: add `railway.toml` in the same directory (included) to pin the start c
 
 ## API
 
-- `GET /api/storms` — Storm catalog loaded from `data/storms.json`.
-- `GET /api/storms/<storm_id>/water_level_series` — Full water-level series for selected storm from `data/water_level_series.json` with `series`, `full_series_start_utc`, `full_series_end_utc`, `default_start_utc`, `default_end_utc`, and `storm_windows`.
-- `POST /api/storm/start-session` — JSON `{ storm_id, start_utc, end_utc }` → reuse local ERA5 if present, otherwise download to `data/storm_<storm_id>/era5/ERA5_<start>_<end>.nc`, then return `{ session_id, times, track, gtsm_available, bounds }` where `track` auto-loads from `data/storm_<storm_id>/storm_track/track_<start>_<end>.json` when available.
+- `GET /api/storms?dataset=<dataset>` — Storm catalog loaded from `data/<dataset>/storms.json` (compatibility file generated from master metadata).
+- `GET /api/storms/<storm_id>/water_level_series?dataset=<dataset>` — Water-level series for selected storm, sliced server-side from flat `data/<dataset>/water_level_series.json` using closure bounds +/- 62 hours; returns `series`, `full_series_start_utc`, `full_series_end_utc`, `default_start_utc`, `default_end_utc`, and `storm_windows`.
+- `POST /api/storm/start-session` — JSON `{ storm_id, start_utc, end_utc, dataset }` → reuse local ERA5 if present, otherwise download to `data/<dataset>/storm_<storm_id>/era5/ERA5_<start>_<end>.nc`, then return `{ session_id, times, track, gtsm_available, bounds }` where `track` auto-loads from `data/<dataset>/storm_<storm_id>/storm_track/track_<start>_<end>.json` when available.
 - `POST /api/upload` — multipart `.nc` file → `{ session_id, times, bounds }`
 - `GET /api/frame/<session_id>/<time_index>` — PNG image for that time step
-- `GET /api/gtsm/frame/<session_id>/<time_index>` — GTSM frame PNG for the same timestamp (cached under `data/storm_<storm_id>/gtsm/`)
+- `GET /api/gtsm/frame/<session_id>/<time_index>` — GTSM frame PNG for the same timestamp (cached under `data/<dataset>/storm_<storm_id>/gtsm/`)
 - `POST /api/track/add` — JSON `{ session_id, time_index, lon, lat }` → append point (pressure interpolated)
 - `POST /api/track/delete` — JSON `{ session_id, time_index }` (or `time_index: -1` to remove last)
 - `GET /api/track/<session_id>` — current track as JSON
-- `POST /api/track/update/<session_id>` — persist track to `data/storm_<storm_id>/storm_track/track_<start>_<end>.json` (storm window key) and persist derived `storm_window` (min/max labelled frame times) into `data/storms.json`
+- `POST /api/track/update/<session_id>` — persist track to `data/<dataset>/storm_<storm_id>/storm_track/track_<start>_<end>.json` (storm window key) and persist derived `storm_window` (min/max labelled frame times) into `data/<dataset>/storms.json`
 
-Sessions are in-memory for live editing, but storm tracks are persisted per storm under `data/storm_<storm_id>/storm_track` when updated.
+Sessions are in-memory for live editing, but storm tracks are persisted per storm under `data/<dataset>/storm_<storm_id>/storm_track` when updated.
 
 ## Migrate existing data layout
 

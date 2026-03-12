@@ -3,8 +3,8 @@
 Bootstrap storms metadata and water-level series for StormTracker.
 
 Generates:
-- StormTracker/data/storms.json
-- StormTracker/data/water_level_series.json
+- StormTracker/data/eastern_scheldt/storms.json
+- StormTracker/data/eastern_scheldt/water_level_series.json (flat full time series)
 """
 
 from __future__ import annotations
@@ -26,7 +26,10 @@ ANALYSIS_OUTPUT_DIR = Path(
     )
 ).expanduser()
 MAST1_PATH = ANALYSIS_OUTPUT_DIR / "mast1.pkl"
-DATA_DIR = Path(os.getenv("STORMTRACKER_DATA_DIR", str(PROJECT_DIR / "data"))).expanduser()
+DEFAULT_DATA_ROOT = Path(os.getenv("STORMTRACKER_DATA_DIR", str(PROJECT_DIR / "data"))).expanduser()
+DATA_DIR = Path(
+    os.getenv("STORMTRACKER_EASTERN_SCHELDT_DATA_DIR", str(DEFAULT_DATA_ROOT / "eastern_scheldt"))
+).expanduser()
 STORMS_PATH = DATA_DIR / "storms.json"
 WATER_LEVEL_SERIES_PATH = DATA_DIR / "water_level_series.json"
 
@@ -52,7 +55,6 @@ def main() -> int:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     storms = []
-    water = {"storms": {}}
     for sid in sorted(storm_df["Storm"].unique()):
         group = storm_df[storm_df["Storm"] == sid].copy()
         group["Start of Closure"] = pd.to_datetime(group["Start of Closure"])
@@ -81,38 +83,23 @@ def main() -> int:
         storms.append(
             {
                 "storm": storm_name,
+                "storm_type": None,
                 "era5_window": {"start": default_start, "end": default_end},
                 "storm_window": {"start": None, "end": None},
                 "closures": closures,
             }
         )
 
-        # Full series in UTC hourly nearest samples around closure span +/- 7 days
-        start_local = pd.to_datetime(group["Start of Closure"]).min() - pd.Timedelta(days=7)
-        end_local = pd.to_datetime(group["End of Closure"]).fillna(pd.to_datetime(group["Start of Closure"]) + pd.Timedelta(days=1)).max() + pd.Timedelta(days=7)
-        mask = (tsp >= start_local) & (tsp <= end_local)
-        if np.any(mask):
-            tsp_sub = tsp[mask]
-            wlp_sub = wlp[mask]
-            sup_sub = sup[mask]
-            tip_sub = tip[mask]
-            hourly = pd.date_range(start=pd.Timestamp(start_local).floor("h"), end=pd.Timestamp(end_local).ceil("h"), freq="h")
-            series = []
-            for h in hourly:
-                diff = np.abs(tsp_sub - pd.Timestamp(h))
-                idx = int(np.argmin(diff))
-                series.append(
-                    {
-                        "time_utc": amsterdam_to_utc_iso(pd.Timestamp(tsp_sub[idx])),
-                        "water_level": float(wlp_sub[idx]) if not np.isnan(wlp_sub[idx]) else None,
-                        "surge": float(sup_sub[idx]) if not np.isnan(sup_sub[idx]) else None,
-                        "tide": float(tip_sub[idx]) if not np.isnan(tip_sub[idx]) else None,
-                    }
-                )
-        else:
-            series = []
-        water["storms"][storm_name] = series
-        water["storms"][str(int(sid))] = series
+    water = []
+    for i, t in enumerate(tsp):
+        water.append(
+            {
+                "time_utc": amsterdam_to_utc_iso(pd.Timestamp(t)),
+                "water_level": float(wlp[i]) if not np.isnan(wlp[i]) else None,
+                "surge": float(sup[i]) if not np.isnan(sup[i]) else None,
+                "tide": float(tip[i]) if not np.isnan(tip[i]) else None,
+            }
+        )
 
     STORMS_PATH.write_text(json.dumps(storms, indent=2), encoding="utf-8")
     WATER_LEVEL_SERIES_PATH.write_text(json.dumps(water, indent=2), encoding="utf-8")

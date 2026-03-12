@@ -15,17 +15,52 @@
   <div id="app">
     <header>
       <h1>StormTracker ERA5</h1>
-      <p class="subtitle">Select a storm, inspect water levels, choose ERA5 dates, then click to draw the track.</p>
+      <p class="subtitle">Select a closure, inspect water levels, choose ERA5 dates, then click to draw the track.</p>
     </header>
 
     <section id="storm-section">
       <div class="storm-layout">
         <div class="storm-detail-panel">
           <h2 class="panel-title">Water levels &amp; ERA5 window</h2>
-          <p class="gauge-label">Tide gauge: Eastern Scheldt (3.68°E, 51.64°N)</p>
-          <p class="window-label">Choose storm:</p>
-          <select id="storm-select"></select>
+          <p id="gauge-label" class="gauge-label">Tide gauge: Eastern Scheldt (3.68°E, 51.64°N)</p>
+          <p class="window-label">Filter barrier:</p>
+          <select id="barrier-filter-select">
+            <option value="all">All barriers</option>
+            <option value="eastern_scheldt">Eastern Scheldt</option>
+            <option value="thames">Thames</option>
+          </select>
+          <p class="window-label">Closures:</p>
+          <div class="closures-table-wrap">
+            <table id="closures-table" class="closures-table">
+              <thead>
+                <tr>
+                  <th>Closure Time (UTC)</th>
+                  <th>Barrier</th>
+                  <th>Storm Type</th>
+                </tr>
+              </thead>
+              <tbody id="closures-table-body"></tbody>
+            </table>
+          </div>
           <div id="storm-meta" class="storm-meta"></div>
+          <div id="storm-type-editor" class="era5-window-section" hidden>
+            <p class="window-label">Storm Type</p>
+            <div class="era5-window-controls">
+              <div class="range-row">
+                <div class="range-field">
+                  <label for="storm-type-select">Select storm type</label>
+                  <select id="storm-type-select">
+                    <option value="">Unset</option>
+                    <option value="Channel Rate">Channel Rate</option>
+                    <option value="North Sea Storm">North Sea Storm</option>
+                  </select>
+                </div>
+              </div>
+              <div class="era5-action-row">
+                <button type="button" id="btn-storm-type-save" class="button secondary-button" disabled>Save Storm Type</button>
+              </div>
+            </div>
+          </div>
             <div id="water-level-container" class="water-level-container">
             <p id="water-level-placeholder" class="placeholder">Select a storm to load water level and surge time series.</p>
             <p id="water-level-loading" class="loading-message" hidden>Loading series…</p>

@@ -41,6 +41,7 @@ YB_GTSM = [45, 60]
 
 # Session TTL (seconds); optional cleanup not implemented in MVP
 SESSION_TTL = 3600
+WATER_SERIES_PAD_HOURS = 62
 
 # Paths
 APP_DIR = Path(__file__).resolve().parent
@@ -69,22 +70,49 @@ DEFAULT_CODEC_GTSM_DIRS = [
     LEGACY_OBJECTIVE_DIR / "2_Data" / "3_CODEC_GTSM_API",
 ]
 
-DATA_DIR = _env_path("STORMTRACKER_DATA_DIR", PROJECT_DIR / "data")
-STORMS_PATH = DATA_DIR / "storms.json"
-WATER_LEVEL_SERIES_PATH = DATA_DIR / "water_level_series.json"
+DATA_ROOT_DIR = _env_path("STORMTRACKER_DATA_DIR", PROJECT_DIR / "data")
+SUPPORTED_DATASETS = ("eastern_scheldt", "thames")
+DEFAULT_DATASET = os.getenv("STORMTRACKER_DEFAULT_DATASET", "eastern_scheldt").strip() or "eastern_scheldt"
+ALLOWED_STORM_TYPES = ("Channel Rate", "North Sea Storm")
 CODEC_GTSM_DIRS = _env_path_list("STORMTRACKER_CODEC_GTSM_DIRS", DEFAULT_CODEC_GTSM_DIRS)
 
 
-def _storm_root_dir(storm_id: int) -> Path:
-    return DATA_DIR / f"storm_{int(storm_id)}"
+def _normalize_dataset(dataset: str | None) -> str:
+    resolved = (dataset or DEFAULT_DATASET).strip().lower()
+    if resolved not in SUPPORTED_DATASETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid dataset '{dataset}'. Supported datasets: {', '.join(SUPPORTED_DATASETS)}",
+        )
+    return resolved
 
 
-def _storm_era5_dir(storm_id: int) -> Path:
-    return _storm_root_dir(storm_id) / "era5"
+def _dataset_dir(dataset: str | None = None) -> Path:
+    return DATA_ROOT_DIR / _normalize_dataset(dataset)
 
 
-def _storm_gtsm_dir(storm_id: int) -> Path:
-    return _storm_root_dir(storm_id) / "gtsm"
+def _storms_path(dataset: str | None = None) -> Path:
+    return _dataset_dir(dataset) / "storms.json"
+
+
+def _master_storms_path() -> Path:
+    return DATA_ROOT_DIR / "storms.json"
+
+
+def _water_level_series_path(dataset: str | None = None) -> Path:
+    return _dataset_dir(dataset) / "water_level_series.json"
+
+
+def _storm_root_dir(storm_id: int, dataset: str | None = None) -> Path:
+    return _dataset_dir(dataset) / f"storm_{int(storm_id)}"
+
+
+def _storm_era5_dir(storm_id: int, dataset: str | None = None) -> Path:
+    return _storm_root_dir(storm_id, dataset) / "era5"
+
+
+def _storm_gtsm_dir(storm_id: int, dataset: str | None = None) -> Path:
+    return _storm_root_dir(storm_id, dataset) / "gtsm"
 
 
 def _era5_file_name(start_iso: str, end_iso: str) -> str:
@@ -142,6 +170,32 @@ def _normalize_iso_utc(value: str | None) -> str | None:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _normalize_storm_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s in ALLOWED_STORM_TYPES:
+        return s
+    lowered = s.lower()
+    if lowered == "channel rate":
+        return "Channel Rate"
+    if lowered == "north sea storm":
+        return "North Sea Storm"
+    return None
+
+
+def _validate_storm_type_input(value: str | None) -> str | None:
+    normalized = _normalize_storm_type(value)
+    if normalized is not None:
+        return normalized
+    if value is None or not str(value).strip():
+        return None
+    allowed = ", ".join(ALLOWED_STORM_TYPES)
+    raise HTTPException(status_code=400, detail=f"Invalid storm_type. Allowed values: {allowed}")
+
+
 def _canonical_window(start_value: str | datetime, end_value: str | datetime) -> tuple[str, str]:
     start_iso = _normalize_iso_utc(start_value.isoformat() if isinstance(start_value, datetime) else str(start_value))
     end_iso = _normalize_iso_utc(end_value.isoformat() if isinstance(end_value, datetime) else str(end_value))
@@ -185,8 +239,8 @@ def _storm_int_from_name(storm_name: str) -> int:
     return int(digits[-1])
 
 
-def _load_storms_metadata() -> list[dict]:
-    payload = _json_load(STORMS_PATH)
+def _load_storms_metadata(dataset: str | None = None) -> list[dict]:
+    payload = _json_load(_storms_path(dataset))
     if not isinstance(payload, list):
         raise HTTPException(status_code=500, detail="storms.json must be a JSON list")
     cleaned = []
@@ -199,6 +253,7 @@ def _load_storms_metadata() -> list[dict]:
         cleaned.append(
             {
                 "storm": str(row["storm"]),
+                "storm_type": _normalize_storm_type(row.get("storm_type")),
                 "era5_window": {
                     "start": _normalize_iso_utc(era5_window.get("start")),
                     "end": _normalize_iso_utc(era5_window.get("end")),
@@ -220,7 +275,44 @@ def _load_storms_metadata() -> list[dict]:
     return cleaned
 
 
-def _save_storms_metadata(rows: list[dict]) -> None:
+def _load_master_storms_metadata() -> list[dict]:
+    payload = _json_load(_master_storms_path())
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=500, detail="master storms.json must be a JSON list")
+    cleaned = []
+    for row in payload:
+        if not isinstance(row, dict) or not row.get("storm"):
+            continue
+        era5_window = row.get("era5_window") or {}
+        storm_window = row.get("storm_window") or {}
+        closures = row.get("closures") if isinstance(row.get("closures"), list) else []
+        cleaned.append(
+            {
+                "storm": str(row["storm"]),
+                "storm_type": _normalize_storm_type(row.get("storm_type")),
+                "era5_window": {
+                    "start": _normalize_iso_utc(era5_window.get("start")),
+                    "end": _normalize_iso_utc(era5_window.get("end")),
+                },
+                "storm_window": {
+                    "start": _normalize_iso_utc(storm_window.get("start")),
+                    "end": _normalize_iso_utc(storm_window.get("end")),
+                },
+                "closures": [
+                    {
+                        "start": _normalize_iso_utc(c.get("start")),
+                        "end": _normalize_iso_utc(c.get("end")),
+                        "barrier": str(c.get("barrier") or "").strip().lower(),
+                    }
+                    for c in closures
+                    if isinstance(c, dict)
+                ],
+            }
+        )
+    return cleaned
+
+
+def _save_storms_metadata(rows: list[dict], dataset: str | None = None) -> None:
     # Persist storms.json in canonical minimal schema only.
     normalized_rows = []
     for row in rows:
@@ -232,6 +324,7 @@ def _save_storms_metadata(rows: list[dict]) -> None:
         normalized_rows.append(
             {
                 "storm": str(row["storm"]),
+                "storm_type": _normalize_storm_type(row.get("storm_type")),
                 "era5_window": {
                     "start": _normalize_iso_utc(era5_window.get("start")),
                     "end": _normalize_iso_utc(era5_window.get("end")),
@@ -250,11 +343,11 @@ def _save_storms_metadata(rows: list[dict]) -> None:
                 ],
             }
         )
-    _json_save(STORMS_PATH, normalized_rows)
+    _json_save(_storms_path(dataset), normalized_rows)
 
 
-def _find_storm_meta(storm_id: int) -> tuple[int, dict]:
-    rows = _load_storms_metadata()
+def _find_storm_meta(storm_id: int, dataset: str | None = None) -> tuple[int, dict]:
+    rows = _load_storms_metadata(dataset)
     for idx, row in enumerate(rows):
         try:
             if _storm_int_from_name(row["storm"]) == int(storm_id):
@@ -264,9 +357,9 @@ def _find_storm_meta(storm_id: int) -> tuple[int, dict]:
     raise HTTPException(status_code=404, detail=f"Storm {storm_id} not found in storms.json")
 
 
-def _storm_track_path(storm_id: int, start_iso: str, end_iso: str) -> Path:
+def _storm_track_path(storm_id: int, start_iso: str, end_iso: str, dataset: str | None = None) -> Path:
     sid = int(storm_id)
-    return _storm_root_dir(sid) / "storm_track" / _storm_track_file_name(start_iso, end_iso)
+    return _storm_root_dir(sid, dataset) / "storm_track" / _storm_track_file_name(start_iso, end_iso)
 
 
 def _export_path_for_session(
@@ -279,10 +372,11 @@ def _export_path_for_session(
 ) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     storm_id = session.get("storm_id")
+    dataset = session.get("dataset")
     if storm_id is not None:
-        base_dir = _storm_root_dir(int(storm_id)) / "exports"
+        base_dir = _storm_root_dir(int(storm_id), dataset) / "exports"
     else:
-        base_dir = DATA_DIR / "exports" / f"session_{session_id}"
+        base_dir = _dataset_dir(dataset) / "exports" / f"session_{session_id}"
     start_idx = int(frame_indices[0])
     end_idx = int(frame_indices[-1])
     name = f"{product}_{start_idx:04d}_{end_idx:04d}_{fps}fps_{stamp}.{fmt}"
@@ -358,10 +452,11 @@ def _load_persisted_track(
     start_iso: str | None,
     end_iso: str | None,
     frame_list: list[tuple[int, pd.Timestamp]],
+    dataset: str | None = None,
 ) -> list[dict]:
     if not start_iso or not end_iso:
         return []
-    path = _storm_track_path(storm_id, start_iso, end_iso)
+    path = _storm_track_path(storm_id, start_iso, end_iso, dataset)
     if not path.exists():
         return []
     payload = _json_load(path)
@@ -375,42 +470,82 @@ def _pick_default_window(meta: dict) -> tuple[str | None, str | None]:
     return era5_win.get("start"), era5_win.get("end")
 
 
-def _era5_path_for_window(storm_id: int, start_iso: str, end_iso: str) -> Path:
+def _era5_path_for_window(storm_id: int, start_iso: str, end_iso: str, dataset: str | None = None) -> Path:
     sid = int(storm_id)
-    return _storm_era5_dir(sid) / _era5_file_name(start_iso, end_iso)
+    return _storm_era5_dir(sid, dataset) / _era5_file_name(start_iso, end_iso)
 
 
-def _load_water_level_series_all() -> dict:
-    payload = _json_load(WATER_LEVEL_SERIES_PATH)
-    if isinstance(payload, dict):
-        storms = payload.get("storms")
-        if isinstance(storms, dict):
-            return storms
+def _load_water_level_series_all(dataset: str | None = None) -> list[dict]:
+    payload = _json_load(_water_level_series_path(dataset))
     if isinstance(payload, list):
-        out = {}
-        for row in payload:
-            if not isinstance(row, dict):
-                continue
-            name = row.get("storm")
-            series = row.get("series")
-            if name and isinstance(series, list):
-                out[str(name)] = series
-        return out
-    raise HTTPException(status_code=500, detail="water_level_series.json must contain storm series data")
+        return payload
+    raise HTTPException(
+        status_code=500,
+        detail="water_level_series.json must be a flat JSON list.",
+    )
 
 
-def _series_for_storm(storm_id: int, storm_name: str) -> list[dict]:
-    all_series = _load_water_level_series_all()
-    keys = [storm_name, str(storm_id), f"storm_{storm_id}"]
-    for key in keys:
-        if key in all_series and isinstance(all_series[key], list):
-            return all_series[key]
+def _storm_series_window(meta: dict, pad_hours: int = WATER_SERIES_PAD_HOURS) -> tuple[str | None, str | None]:
+    closures = [c for c in (meta.get("closures") or []) if isinstance(c, dict)]
+    starts = [pd.Timestamp(c["start"]) for c in closures if c.get("start")]
+    ends = [pd.Timestamp(c["end"]) for c in closures if c.get("end")]
+    if starts and ends:
+        start = (min(starts) - pd.Timedelta(hours=pad_hours)).to_pydatetime()
+        end = (max(ends) + pd.Timedelta(hours=pad_hours)).to_pydatetime()
+        return _canonical_window(start, end)
+
+    storm_window = meta.get("storm_window") or {}
+    sw_start = _normalize_iso_utc(storm_window.get("start"))
+    sw_end = _normalize_iso_utc(storm_window.get("end"))
+    if sw_start and sw_end:
+        start = (pd.Timestamp(sw_start) - pd.Timedelta(hours=pad_hours)).to_pydatetime()
+        end = (pd.Timestamp(sw_end) + pd.Timedelta(hours=pad_hours)).to_pydatetime()
+        return _canonical_window(start, end)
+
+    return _pick_default_window(meta)
+
+
+def _normalized_series_rows(series_rows: list[dict]) -> list[dict]:
+    normalized = []
+    for p in series_rows:
+        if not isinstance(p, dict):
+            continue
+        t_utc = _normalize_iso_utc(p.get("time_utc") or p.get("time"))
+        if not t_utc:
+            continue
+        normalized.append(
+            {
+                "time_utc": t_utc,
+                "water_level": p.get("water_level", p.get("water_level_m")),
+                "surge": p.get("surge", p.get("surge_m")),
+                "tide": p.get("tide", p.get("predicted_tide_m")),
+            }
+        )
+    normalized.sort(key=lambda p: p["time_utc"])
+    return normalized
+
+
+def _slice_flat_series_for_storm(series_rows: list[dict], meta: dict) -> list[dict]:
+    normalized = _normalized_series_rows(series_rows)
+    if not normalized:
+        return []
+    win_start, win_end = _storm_series_window(meta)
+    if not win_start or not win_end:
+        return normalized
+    return [p for p in normalized if win_start <= p["time_utc"] <= win_end]
+
+
+def _series_for_storm(storm_id: int, meta: dict, dataset: str | None = None) -> list[dict]:
+    payload = _load_water_level_series_all(dataset)
+    sliced = _slice_flat_series_for_storm(payload, meta)
+    if sliced:
+        return sliced
     raise HTTPException(status_code=404, detail=f"No water-level series found for storm {storm_id}")
 
 
-def _get_storm_catalog() -> list[dict]:
+def _get_storm_catalog(dataset: str | None = None) -> list[dict]:
     rows = []
-    for storm in _load_storms_metadata():
+    for storm in _load_storms_metadata(dataset):
         sid = _storm_int_from_name(storm["storm"])
         default_start, default_end = _pick_default_window(storm)
         closures = storm.get("closures") or []
@@ -420,6 +555,7 @@ def _get_storm_catalog() -> list[dict]:
             {
                 "storm_id": sid,
                 "storm": storm["storm"],
+                "storm_type": storm.get("storm_type"),
                 "label": storm["storm"].replace("_", " ").title(),
                 "storm_start_utc": c_start,
                 "storm_end_utc": c_end,
@@ -437,43 +573,143 @@ def _get_storm_catalog() -> list[dict]:
     return rows
 
 
+def _get_closure_catalog(barrier: str | None = None) -> list[dict]:
+    barrier_key = (barrier or "").strip().lower() or None
+    if barrier_key and barrier_key not in SUPPORTED_DATASETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid barrier '{barrier}'. Supported barriers: {', '.join(SUPPORTED_DATASETS)}",
+        )
+    rows = []
+    for storm in _load_master_storms_metadata():
+        master_storm = str(storm.get("storm") or "")
+        if not master_storm:
+            continue
+        try:
+            master_storm_id = _storm_int_from_name(master_storm)
+        except HTTPException:
+            continue
+        default_start, default_end = _pick_default_window(storm)
+        for c in storm.get("closures") or []:
+            if not isinstance(c, dict):
+                continue
+            closure_barrier = str(c.get("barrier") or "").strip().lower()
+            if closure_barrier not in SUPPORTED_DATASETS:
+                continue
+            if barrier_key and closure_barrier != barrier_key:
+                continue
+            c_start = _normalize_iso_utc(c.get("start"))
+            c_end = _normalize_iso_utc(c.get("end"))
+            if not c_start or not c_end:
+                continue
+            rows.append(
+                {
+                    "master_storm": master_storm,
+                    "master_storm_id": master_storm_id,
+                    "storm_type": storm.get("storm_type"),
+                    "closure_start_utc": c_start,
+                    "closure_end_utc": c_end,
+                    "barrier": closure_barrier,
+                    "default_start_utc": default_start,
+                    "default_end_utc": default_end,
+                }
+            )
+    rows.sort(key=lambda r: (r["closure_start_utc"], r["closure_end_utc"], r["barrier"]))
+    return rows
+
+
+def _resolve_closure_to_storm(barrier: str, start_utc: str, end_utc: str) -> tuple[int, dict]:
+    barrier_key = _normalize_dataset(barrier)
+    c_start = _normalize_iso_utc(start_utc)
+    c_end = _normalize_iso_utc(end_utc)
+    if not c_start or not c_end:
+        raise HTTPException(status_code=400, detail="Invalid closure start/end timestamp")
+
+    for row in _load_storms_metadata(barrier_key):
+        try:
+            sid = _storm_int_from_name(str(row.get("storm") or ""))
+        except HTTPException:
+            continue
+        for c in row.get("closures") or []:
+            if not isinstance(c, dict):
+                continue
+            if _normalize_iso_utc(c.get("start")) == c_start and _normalize_iso_utc(c.get("end")) == c_end:
+                return sid, row
+    raise HTTPException(
+        status_code=404,
+        detail=f"No storm mapping found for closure {c_start}..{c_end} in barrier '{barrier_key}'",
+    )
+
+
+class StormTypeUpdateBody(BaseModel):
+    storm_type: str | None = None
+    dataset: str | None = None
+
+
 @app.get("/api/storms")
-async def api_storms():
+async def api_storms(dataset: str | None = None):
     """
     Return storm catalog with suggested ERA5 download windows and
     whether a pre-generated water level plot exists.
     """
-    return {"storms": _get_storm_catalog()}
+    dataset_key = _normalize_dataset(dataset)
+    return {"dataset": dataset_key, "storms": _get_storm_catalog(dataset_key)}
+
+
+@app.post("/api/storms/{storm_id}/storm-type")
+async def api_update_storm_type(storm_id: int, body: StormTypeUpdateBody):
+    dataset_key = _normalize_dataset(body.dataset)
+    rows = _load_storms_metadata(dataset_key)
+    idx, row = _find_storm_meta(storm_id, dataset_key)
+    storm_type = _validate_storm_type_input(body.storm_type)
+    rows[idx]["storm_type"] = storm_type
+    _save_storms_metadata(rows, dataset_key)
+    return {
+        "dataset": dataset_key,
+        "storm_id": int(storm_id),
+        "storm": row.get("storm"),
+        "storm_type": storm_type,
+    }
+
+
+@app.get("/api/closures")
+async def api_closures(barrier: str | None = None):
+    rows = _get_closure_catalog(barrier=barrier)
+    return {"closures": rows, "barrier": (barrier or "").strip().lower() or "all"}
+
+
+@app.get("/api/closures/resolve")
+async def api_closure_resolve(
+    barrier: str,
+    start_utc: str,
+    end_utc: str,
+):
+    storm_id, meta = _resolve_closure_to_storm(barrier=barrier, start_utc=start_utc, end_utc=end_utc)
+    default_start, default_end = _pick_default_window(meta)
+    return {
+        "dataset": _normalize_dataset(barrier),
+        "storm_id": int(storm_id),
+        "default_start_utc": default_start,
+        "default_end_utc": default_end,
+        "storm": meta.get("storm"),
+        "storm_type": meta.get("storm_type"),
+    }
 
 
 @app.get("/api/storms/{storm_id}/water_level_series")
 async def api_storm_water_level_series(
     storm_id: int,
+    dataset: str | None = None,
 ):
-    _, meta = _find_storm_meta(storm_id)
-    series = _series_for_storm(storm_id, meta["storm"])
-    normalized = []
-    for p in series:
-        if not isinstance(p, dict):
-            continue
-        t_utc = _normalize_iso_utc(p.get("time_utc") or p.get("time"))
-        if not t_utc:
-            continue
-        normalized.append(
-            {
-                "time_utc": t_utc,
-                "water_level": p.get("water_level", p.get("water_level_m")),
-                "surge": p.get("surge", p.get("surge_m")),
-                "tide": p.get("tide", p.get("predicted_tide_m")),
-            }
-        )
-    normalized.sort(key=lambda p: p["time_utc"])
+    dataset_key = _normalize_dataset(dataset)
+    _, meta = _find_storm_meta(storm_id, dataset_key)
+    normalized = _series_for_storm(storm_id, meta, dataset_key)
     default_start, default_end = _pick_default_window(meta)
     full_start = normalized[0]["time_utc"] if normalized else default_start
     full_end = normalized[-1]["time_utc"] if normalized else default_end
     default_window_cached = False
     if default_start and default_end:
-        default_window_cached = _era5_path_for_window(storm_id, default_start, default_end).exists()
+        default_window_cached = _era5_path_for_window(storm_id, default_start, default_end, dataset_key).exists()
     return {
         "series": normalized,
         "full_series_start_utc": full_start,
@@ -487,6 +723,8 @@ async def api_storm_water_level_series(
             if c.get("start") and c.get("end")
         ],
         "storm": meta["storm"],
+        "storm_type": meta.get("storm_type"),
+        "dataset": dataset_key,
     }
 
 
@@ -746,16 +984,24 @@ def get_session(session_id: str):
 def _create_session_from_era5(
     path: Path,
     storm_id: int | None = None,
+    dataset: str | None = None,
     window_start_utc: str | None = None,
     window_end_utc: str | None = None,
     track_window_start_utc: str | None = None,
     track_window_end_utc: str | None = None,
 ) -> dict:
+    dataset_key = _normalize_dataset(dataset)
     data = parse_era5(path)
     track_start = track_window_start_utc or window_start_utc
     track_end = track_window_end_utc or window_end_utc
     persisted_track = (
-        _load_persisted_track(int(storm_id), track_start, track_end, data["frame_list"])
+        _load_persisted_track(
+            int(storm_id),
+            track_start,
+            track_end,
+            data["frame_list"],
+            dataset=dataset_key,
+        )
         if storm_id is not None
         else []
     )
@@ -763,6 +1009,7 @@ def _create_session_from_era5(
     sessions[session_id] = {
         "path": path,
         "storm_id": int(storm_id) if storm_id is not None else None,
+        "dataset": dataset_key,
         "window_start_utc": window_start_utc,
         "window_end_utc": window_end_utc,
         **data,
@@ -792,6 +1039,7 @@ class StartStormSessionBody(BaseModel):
     storm_id: int
     start_utc: str
     end_utc: str
+    dataset: str | None = None
 
 
 def _parse_iso_utc(dt_str: str) -> datetime:
@@ -837,6 +1085,7 @@ async def api_start_storm_session(body: StartStormSessionBody):
     ERA5 files are stored under data/storm_<id>/era5 so they can be reused across sessions.
     """
     storm_id = int(body.storm_id)
+    dataset_key = _normalize_dataset(body.dataset)
     t_start = _parse_iso_utc(body.start_utc)
     t_end = _parse_iso_utc(body.end_utc)
     if t_end <= t_start:
@@ -844,11 +1093,11 @@ async def api_start_storm_session(body: StartStormSessionBody):
     start_iso, end_iso = _canonical_window(t_start, t_end)
     win_key = _window_key(start_iso, end_iso)
 
-    meta_rows = _load_storms_metadata()
-    meta_idx, meta_row = _find_storm_meta(storm_id)
-    storm_era5_dir = _storm_era5_dir(storm_id)
+    meta_rows = _load_storms_metadata(dataset_key)
+    meta_idx, meta_row = _find_storm_meta(storm_id, dataset_key)
+    storm_era5_dir = _storm_era5_dir(storm_id, dataset_key)
     storm_era5_dir.mkdir(parents=True, exist_ok=True)
-    target_era5_path = _era5_path_for_window(storm_id, start_iso, end_iso)
+    target_era5_path = _era5_path_for_window(storm_id, start_iso, end_iso, dataset_key)
     era5_path = target_era5_path if target_era5_path.exists() else None
 
     if era5_path is None:
@@ -902,7 +1151,7 @@ async def api_start_storm_session(body: StartStormSessionBody):
                     p.unlink(missing_ok=True)
 
     meta_rows[meta_idx]["era5_window"] = {"start": start_iso, "end": end_iso}
-    _save_storms_metadata(meta_rows)
+    _save_storms_metadata(meta_rows, dataset_key)
 
     track_window = meta_row.get("storm_window") if isinstance(meta_row.get("storm_window"), dict) else {}
     track_window_start = _normalize_iso_utc(track_window.get("start"))
@@ -911,6 +1160,7 @@ async def api_start_storm_session(body: StartStormSessionBody):
     session_payload = _create_session_from_era5(
         era5_path,
         storm_id=storm_id,
+        dataset=dataset_key,
         window_start_utc=start_iso,
         window_end_utc=end_iso,
         track_window_start_utc=track_window_start,
@@ -988,8 +1238,9 @@ def _build_gtsm_subset_for_window(
     start_iso: str,
     end_iso: str,
     frame_times: list[pd.Timestamp],
+    dataset: str | None = None,
 ) -> Path | None:
-    subset_dir = _storm_gtsm_dir(storm_id)
+    subset_dir = _storm_gtsm_dir(storm_id, dataset)
     subset_dir.mkdir(parents=True, exist_ok=True)
     subset_path = subset_dir / _gtsm_subset_file_name(start_iso, end_iso)
     if subset_path.exists():
@@ -1148,7 +1399,13 @@ def _build_session_gtsm_subset(session: dict) -> Path | None:
     if not start_iso or not end_iso:
         return None
     frame_times = [pd.Timestamp(t) for _, t in (session.get("frame_list") or [])]
-    subset = _build_gtsm_subset_for_window(int(storm_id), start_iso, end_iso, frame_times)
+    subset = _build_gtsm_subset_for_window(
+        int(storm_id),
+        start_iso,
+        end_iso,
+        frame_times,
+        dataset=session.get("dataset"),
+    )
     if subset:
         session["gtsm_subset_path"] = str(subset)
     return subset
@@ -1171,7 +1428,7 @@ def _gtsm_frame_cache_path(session: dict, time_index: int) -> Path:
     if not start_iso or not end_iso:
         raise HTTPException(status_code=500, detail="Unable to resolve session window for GTSM")
     win_key = _window_key(start_iso, end_iso)
-    out_dir = _storm_gtsm_dir(int(storm_id)) / win_key
+    out_dir = _storm_gtsm_dir(int(storm_id), session.get("dataset")) / win_key
     # Cache version in filename so rendered overlays can evolve safely.
     out_name = f"gtsm_v2_{_window_token(_normalize_iso_utc(ts_pd.isoformat()) or ts_pd.strftime('%Y%m%dT%H%M%SZ'))}.png"
     return out_dir / out_name
@@ -1458,6 +1715,7 @@ async def api_track_update(session_id: str):
     session = get_session(session_id)
     session["last_access"] = time.time()
     storm_id = session.get("storm_id")
+    dataset = session.get("dataset")
     if storm_id is None:
         raise HTTPException(status_code=400, detail="Session is not associated with a storm_id")
     track = session.get("track") or []
@@ -1472,13 +1730,13 @@ async def api_track_update(session_id: str):
     start_iso = pd.Timestamp(start_ts).to_pydatetime().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
     end_iso = pd.Timestamp(end_ts).to_pydatetime().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
-    track_path = _storm_track_path(int(storm_id), start_iso, end_iso)
+    track_path = _storm_track_path(int(storm_id), start_iso, end_iso, dataset)
     track_path.parent.mkdir(parents=True, exist_ok=True)
     _json_save(track_path, _serialise_track_for_storage(track))
-    rows = _load_storms_metadata()
-    idx, _ = _find_storm_meta(int(storm_id))
+    rows = _load_storms_metadata(dataset)
+    idx, _ = _find_storm_meta(int(storm_id), dataset)
     rows[idx]["storm_window"] = {"start": start_iso, "end": end_iso}
-    _save_storms_metadata(rows)
+    _save_storms_metadata(rows, dataset)
     return {
         "rows": len(track),
         "track_path": _rel_path_str(track_path),

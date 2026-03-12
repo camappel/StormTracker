@@ -9,8 +9,9 @@
     times: [],
     timeIndex: 0,
     track: [],
-    storms: [],
+    closures: [],
     selectedStormId: null,
+    selectedClosureKey: null,
     waterSeries: [],
     window: { startIndex: 0, endIndex: 0 },
     stormWindows: [],
@@ -29,10 +30,28 @@
     autoStartRequestId: 0,
     gtsmAvailable: false,
     trackDirty: false,
-    exportBusy: false
+    exportBusy: false,
+    selectedDataset: 'eastern_scheldt',
+    selectedStormType: null
   };
 
-  const stormSelect = document.getElementById('storm-select');
+  const DATASET_META = {
+    eastern_scheldt: {
+      gaugeLabel: 'Tide gauge: Eastern Scheldt (3.68°E, 51.64°N)'
+    },
+    thames: {
+      gaugeLabel: 'Tide gauge: Thames Barrier / Sheerness'
+    }
+  };
+
+  function apiUrl(path) {
+    const qs = new URLSearchParams({ dataset: state.selectedDataset });
+    return `${API}${path}?${qs.toString()}`;
+  }
+
+  const barrierFilterSelect = document.getElementById('barrier-filter-select');
+  const closuresTableBody = document.getElementById('closures-table-body');
+  const gaugeLabel = document.getElementById('gauge-label');
   const stormMeta = document.getElementById('storm-meta');
   const waterLevelPlaceholder = document.getElementById('water-level-placeholder');
   const waterLevelLoading = document.getElementById('water-level-loading');
@@ -65,6 +84,15 @@
   const btnExportGtsm = document.getElementById('btn-export-gtsm');
   const btnExportSideBySide = document.getElementById('btn-export-side-by-side');
   const trackInfo = document.getElementById('track-info');
+  const stormTypeEditor = document.getElementById('storm-type-editor');
+  const stormTypeSelect = document.getElementById('storm-type-select');
+  const btnStormTypeSave = document.getElementById('btn-storm-type-save');
+
+  function updateGaugeLabel() {
+    if (!gaugeLabel) return;
+    const meta = DATASET_META[state.selectedDataset] || DATASET_META.eastern_scheldt;
+    gaugeLabel.textContent = meta.gaugeLabel;
+  }
   function showError(msg) {
     uploadError.textContent = msg;
     uploadError.hidden = false;
@@ -639,7 +667,8 @@
         body: JSON.stringify({
           storm_id: state.selectedStormId,
           start_utc: startIso,
-          end_utc: endIso
+          end_utc: endIso,
+          dataset: state.selectedDataset
         })
       });
       const data = await res.json();
@@ -857,28 +886,88 @@
     loadFrame();
   }
 
-  async function loadStormCatalog() {
+  function closureRowKey(row) {
+    if (!row) return '';
+    return `${row.barrier}|${row.closure_start_utc}|${row.closure_end_utc}`;
+  }
+
+  function titleCaseBarrier(barrier) {
+    if (barrier === 'eastern_scheldt') return 'Eastern Scheldt';
+    if (barrier === 'thames') return 'Thames';
+    return barrier || 'Unknown';
+  }
+
+  function displayStormType(stormType) {
+    return stormType || 'Unset';
+  }
+
+  function updateStormTypeSaveButtonState() {
+    if (!btnStormTypeSave || !stormTypeSelect) return;
+    const selectedValue = stormTypeSelect.value || '';
+    const currentValue = state.selectedStormType || '';
+    const canSave = !!state.selectedStormId && selectedValue !== currentValue;
+    btnStormTypeSave.disabled = !canSave;
+  }
+
+  function setStormTypeEditorValue(stormType) {
+    state.selectedStormType = stormType || '';
+    if (stormTypeSelect) {
+      stormTypeSelect.value = state.selectedStormType;
+    }
+    updateStormTypeSaveButtonState();
+  }
+
+  function renderClosuresTable() {
+    if (!closuresTableBody) return;
+    closuresTableBody.innerHTML = '';
+    state.closures.forEach((row) => {
+      const tr = document.createElement('tr');
+      const key = closureRowKey(row);
+      tr.dataset.key = key;
+      if (state.selectedClosureKey && state.selectedClosureKey === key) {
+        tr.classList.add('active');
+      }
+      const tdTime = document.createElement('td');
+      tdTime.textContent = `${formatIsoForDisplay(row.closure_start_utc)} - ${formatIsoForDisplay(row.closure_end_utc)}`;
+      const tdBarrier = document.createElement('td');
+      tdBarrier.textContent = titleCaseBarrier(row.barrier);
+      const tdStormType = document.createElement('td');
+      tdStormType.textContent = displayStormType(row.storm_type);
+      tr.appendChild(tdTime);
+      tr.appendChild(tdBarrier);
+      tr.appendChild(tdStormType);
+      tr.addEventListener('click', () => {
+        selectClosureRow(row);
+      });
+      closuresTableBody.appendChild(tr);
+    });
+  }
+
+  async function loadClosures() {
     try {
-      const res = await fetch(`${API}/api/storms`);
+      const selectedBarrier = (barrierFilterSelect && barrierFilterSelect.value) ? String(barrierFilterSelect.value) : 'all';
+      const qs = new URLSearchParams();
+      if (selectedBarrier && selectedBarrier !== 'all') qs.set('barrier', selectedBarrier);
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      const res = await fetch(`${API}/api/closures${suffix}`);
       if (!res.ok) {
-        throw new Error('Failed to load storms');
+        throw new Error('Failed to load closures');
       }
       const data = await res.json();
-      state.storms = data.storms || [];
-      stormSelect.innerHTML = '';
-      state.storms.forEach((s) => {
-        const opt = document.createElement('option');
-        opt.value = String(s.storm_id);
-        opt.textContent = `${s.storm_id}. ${s.label}`;
-        stormSelect.appendChild(opt);
-      });
-      if (state.storms.length > 0) {
-        state.selectedStormId = state.storms[0].storm_id;
-        stormSelect.value = String(state.selectedStormId);
-        updateStormDetails();
+      state.closures = data.closures || [];
+      state.selectedClosureKey = null;
+      renderClosuresTable();
+      stormMeta.innerHTML = '';
+      if (state.closures.length > 0) {
+        selectClosureRow(state.closures[0]);
+      } else {
+        resetSessionState();
+        resetStormUiState();
+        waterLevelPlaceholder.hidden = false;
+        waterLevelPlaceholder.textContent = 'No closures available for this filter.';
       }
     } catch (e) {
-      showError('Could not load storm list: ' + e.message);
+      showError('Could not load closures: ' + e.message);
     }
   }
 
@@ -886,6 +975,7 @@
     destroyWaterCharts();
     destroyWindowSlider();
     state.sessionId = null;
+    state.selectedStormId = null;
     state.times = [];
     state.activeStartIdx = 0;
     state.activeEndIdx = 0;
@@ -900,6 +990,7 @@
     state.exportBusy = false;
     state.waterSeries = [];
     state.stormWindows = [];
+    state.selectedStormType = null;
     commitEra5Window('', '');
     setTrackAndRefresh([]);
   }
@@ -914,6 +1005,7 @@
     waterLevelChartWrap.hidden = true;
     if (chartRangeSection) chartRangeSection.hidden = true;
     era5WindowSection.hidden = true;
+    if (stormTypeEditor) stormTypeEditor.hidden = true;
     mapSection.hidden = true;
     if (chartRangeStartSelect) chartRangeStartSelect.value = '';
     if (chartRangeEndSelect) chartRangeEndSelect.value = '';
@@ -921,6 +1013,8 @@
     if (activeCurrentFrameEl) activeCurrentFrameEl.textContent = '—';
     if (activeLastFrameEl) activeLastFrameEl.textContent = '—';
     if (activeFrameCountEl) activeFrameCountEl.textContent = '0';
+    if (stormTypeSelect) stormTypeSelect.value = '';
+    if (btnStormTypeSave) btnStormTypeSave.disabled = true;
   }
 
   function setWaterSeriesLoadingState(isLoading) {
@@ -938,35 +1032,89 @@
     }
   }
 
-  function updateStormDetails() {
-    const sid = Number(stormSelect.value);
-    const s = state.storms.find((st) => Number(st.storm_id) === sid);
-    state.selectedStormId = sid;
-    if (!s) return;
-    let hoursText = '';
-    if (s.storm_start_local && s.storm_end_local) {
-      const start = new Date(s.storm_start_local);
-      const end = new Date(s.storm_end_local);
-      if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime()) && end > start) {
-        const diffHours = (end.getTime() - start.getTime()) / 3600000;
-        const rounded = Math.round(diffHours * 10) / 10;
-        hoursText = ` (${rounded} h)`;
-      }
-    }
-    stormMeta.innerHTML = `
-      <div><strong>Storm:</strong> ${s.storm || s.label}</div>
-      <div><strong>Closure window (UTC):</strong> ${formatIsoForDisplay(s.storm_start_local)} - ${formatIsoForDisplay(s.storm_end_local)}${hoursText}</div>
-    `;
+  async function selectClosureRow(row) {
+    if (!row) return;
+    state.selectedClosureKey = closureRowKey(row);
+    renderClosuresTable();
     resetSessionState();
     resetStormUiState();
-
-    const hasSeries = s.has_water_level_series !== false;
-    if (!hasSeries) {
-      waterLevelPlaceholder.textContent = 'No water level series for this storm.';
-      return;
+    state.selectedDataset = row.barrier || 'eastern_scheldt';
+    updateGaugeLabel();
+    stormMeta.innerHTML = `
+      <div><strong>Barrier:</strong> ${titleCaseBarrier(row.barrier)}</div>
+      <div><strong>Storm Type:</strong> ${displayStormType(row.storm_type)}</div>
+      <div><strong>Closure (UTC):</strong> ${formatIsoForDisplay(row.closure_start_utc)} - ${formatIsoForDisplay(row.closure_end_utc)}</div>
+    `;
+    if (stormTypeEditor) stormTypeEditor.hidden = true;
+    try {
+      const qs = new URLSearchParams({
+        barrier: row.barrier,
+        start_utc: row.closure_start_utc,
+        end_utc: row.closure_end_utc
+      });
+      const res = await fetch(`${API}/api/closures/resolve?${qs.toString()}`);
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.detail || 'Could not resolve closure to storm');
+      }
+      state.selectedDataset = payload.dataset || row.barrier;
+      state.selectedStormId = Number(payload.storm_id);
+      setStormTypeEditorValue(payload.storm_type || row.storm_type || '');
+      if (stormTypeEditor) stormTypeEditor.hidden = false;
+      updateGaugeLabel();
+      stormMeta.innerHTML = `
+        <div><strong>Barrier:</strong> ${titleCaseBarrier(state.selectedDataset)}</div>
+        <div><strong>Storm:</strong> ${payload.storm || `storm_${state.selectedStormId}`}</div>
+        <div><strong>Storm Type:</strong> ${displayStormType(state.selectedStormType)}</div>
+        <div><strong>Closure (UTC):</strong> ${formatIsoForDisplay(row.closure_start_utc)} - ${formatIsoForDisplay(row.closure_end_utc)}</div>
+      `;
+      waterLevelPlaceholder.hidden = true;
+      loadWaterLevelSeries(state.selectedStormId);
+    } catch (e) {
+      showError(e.message || 'Could not load selected closure');
     }
-    waterLevelPlaceholder.hidden = true;
-    loadWaterLevelSeries(sid);
+  }
+
+  async function saveSelectedStormType() {
+    if (!state.selectedStormId || !stormTypeSelect) return;
+    const selectedType = stormTypeSelect.value || null;
+    try {
+      const res = await fetch(`${API}/api/storms/${state.selectedStormId}/storm-type`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dataset: state.selectedDataset,
+          storm_type: selectedType
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showError(data.detail || 'Failed to save storm type');
+        return;
+      }
+      clearError();
+      setStormTypeEditorValue(data.storm_type || '');
+      const selectedKey = state.selectedClosureKey;
+      state.closures = state.closures.map((row) => (
+        closureRowKey(row) === selectedKey
+          ? { ...row, storm_type: data.storm_type || null }
+          : row
+      ));
+      renderClosuresTable();
+      const selectedRow = state.closures.find((row) => closureRowKey(row) === selectedKey);
+      if (selectedRow && stormMeta) {
+        stormMeta.innerHTML = `
+          <div><strong>Barrier:</strong> ${titleCaseBarrier(state.selectedDataset)}</div>
+          <div><strong>Storm:</strong> ${data.storm || `storm_${state.selectedStormId}`}</div>
+          <div><strong>Storm Type:</strong> ${displayStormType(data.storm_type)}</div>
+          <div><strong>Closure (UTC):</strong> ${formatIsoForDisplay(selectedRow.closure_start_utc)} - ${formatIsoForDisplay(selectedRow.closure_end_utc)}</div>
+        `;
+      }
+    } catch (e) {
+      showError('Network error: ' + e.message);
+    } finally {
+      updateStormTypeSaveButtonState();
+    }
   }
 
   function loadWaterLevelSeries(sid) {
@@ -975,7 +1123,7 @@
     destroyWindowSlider();
     state.waterSeries = [];
     setWaterSeriesLoadingState(true);
-    const url = `${API}/api/storms/${sid}/water_level_series`;
+    const url = apiUrl(`/api/storms/${sid}/water_level_series`);
     fetch(url)
       .then(function (res) {
         setWaterSeriesLoadingState(false);
@@ -1070,9 +1218,11 @@
     clickLayer.style.width = '100%';
     clickLayer.style.height = 'auto';
   });
-  stormSelect.addEventListener('change', () => {
-    updateStormDetails();
-  });
+  if (barrierFilterSelect) {
+    barrierFilterSelect.addEventListener('change', () => {
+      loadClosures();
+    });
+  }
 
   btnUpdateTrack.addEventListener('click', async () => {
     if (!state.sessionId || state.track.length === 0) return;
@@ -1141,6 +1291,18 @@
     });
   }
 
+  if (stormTypeSelect) {
+    stormTypeSelect.addEventListener('change', () => {
+      updateStormTypeSaveButtonState();
+    });
+  }
+
+  if (btnStormTypeSave) {
+    btnStormTypeSave.addEventListener('click', () => {
+      saveSelectedStormType();
+    });
+  }
+
   [era5StartInput, era5EndInput].forEach((inputEl) => {
     if (!inputEl) return;
     inputEl.addEventListener('input', () => {
@@ -1154,6 +1316,9 @@
   });
 
   updateEra5ApplyButtonDirtyState();
-
-  loadStormCatalog();
+  if (barrierFilterSelect && barrierFilterSelect.value === 'thames') {
+    state.selectedDataset = 'thames';
+  }
+  updateGaugeLabel();
+  loadClosures();
 })();
