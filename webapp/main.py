@@ -12,7 +12,9 @@ import uuid
 import warnings
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 
+import imageio.v2 as imageio
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -267,6 +269,26 @@ def _storm_track_path(storm_id: int, start_iso: str, end_iso: str) -> Path:
     return _storm_root_dir(sid) / "storm_track" / _storm_track_file_name(start_iso, end_iso)
 
 
+def _export_path_for_session(
+    session: dict,
+    session_id: str,
+    product: str,
+    fmt: str,
+    frame_indices: list[int],
+    fps: int,
+) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    storm_id = session.get("storm_id")
+    if storm_id is not None:
+        base_dir = _storm_root_dir(int(storm_id)) / "exports"
+    else:
+        base_dir = DATA_DIR / "exports" / f"session_{session_id}"
+    start_idx = int(frame_indices[0])
+    end_idx = int(frame_indices[-1])
+    name = f"{product}_{start_idx:04d}_{end_idx:04d}_{fps}fps_{stamp}.{fmt}"
+    return base_dir / name
+
+
 def _serialise_track_for_storage(track: list[dict]) -> list[dict]:
     out = []
     for point in track:
@@ -478,6 +500,12 @@ class TrackAddBody(BaseModel):
 class TrackDeleteBody(BaseModel):
     session_id: str
     time_index: int = -1
+
+
+class ExportBody(BaseModel):
+    product: Literal["era5", "gtsm", "side_by_side"]
+    format: Literal["gif", "mp4"] = "gif"
+    fps: int = 4
 
 
 def _time_coord(ds: xr.Dataset):
@@ -1022,7 +1050,14 @@ def _build_gtsm_subset_for_window(
     return subset_path
 
 
-def _render_gtsm_frame_from_subset(subset_path: Path, ts: pd.Timestamp, target_path: Path) -> bool:
+def _render_gtsm_frame_from_subset(
+    subset_path: Path,
+    ts: pd.Timestamp,
+    target_path: Path,
+    *,
+    time_index: int | None = None,
+    total_steps: int | None = None,
+) -> bool:
     if not subset_path.exists():
         return False
     try:
@@ -1072,6 +1107,24 @@ def _render_gtsm_frame_from_subset(subset_path: Path, ts: pd.Timestamp, target_p
             mask = (xs >= XB_GTSM[0]) & (xs <= XB_GTSM[1]) & (ys >= YB_GTSM[0]) & (ys <= YB_GTSM[1])
             ax.scatter(xs[mask], ys[mask], c=vals[mask], s=12, cmap="seismic", transform=ccrs.PlateCarree())
 
+        ts_str = pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
+        if time_index is not None and total_steps is not None and total_steps > 0:
+            label = f"{ts_str} (step {int(time_index) + 1}/{int(total_steps)})"
+        else:
+            label = ts_str
+        ax.text(
+            0.01,
+            0.99,
+            label,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=11,
+            color="white",
+            bbox={"facecolor": "black", "alpha": 0.35, "pad": 3, "edgecolor": "none"},
+            zorder=20,
+        )
+
         target_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(target_path, dpi=100, bbox_inches=None, pad_inches=0)
         plt.close(fig)
@@ -1101,6 +1154,127 @@ def _build_session_gtsm_subset(session: dict) -> Path | None:
     return subset
 
 
+def _gtsm_frame_cache_path(session: dict, time_index: int) -> Path:
+    frame_list = session.get("frame_list") or []
+    if time_index < 0 or time_index >= len(frame_list):
+        raise HTTPException(status_code=404, detail="Invalid time_index")
+    storm_id = session.get("storm_id")
+    if storm_id is None:
+        raise HTTPException(status_code=400, detail="GTSM export requires a storm session")
+    _, ts = frame_list[time_index]
+    ts_pd = pd.Timestamp(ts)
+    start_iso = session.get("window_start_utc")
+    end_iso = session.get("window_end_utc")
+    if not start_iso or not end_iso:
+        start_iso = _normalize_iso_utc(pd.Timestamp(frame_list[0][1]).isoformat())
+        end_iso = _normalize_iso_utc(pd.Timestamp(frame_list[-1][1]).isoformat())
+    if not start_iso or not end_iso:
+        raise HTTPException(status_code=500, detail="Unable to resolve session window for GTSM")
+    win_key = _window_key(start_iso, end_iso)
+    out_dir = _storm_gtsm_dir(int(storm_id)) / win_key
+    # Cache version in filename so rendered overlays can evolve safely.
+    out_name = f"gtsm_v2_{_window_token(_normalize_iso_utc(ts_pd.isoformat()) or ts_pd.strftime('%Y%m%dT%H%M%SZ'))}.png"
+    return out_dir / out_name
+
+
+def _resolve_export_indices(session: dict, product: str, pad_frames: int = 3) -> list[int]:
+    start_idx, end_idx = _labelled_window_indices(session, pad_hours=0)
+    frame_count = len(session.get("frame_list") or [])
+    if frame_count == 0:
+        raise HTTPException(status_code=400, detail="No session frames available")
+    base_indices = list(range(start_idx, end_idx + 1))
+    if not base_indices:
+        raise HTTPException(status_code=400, detail="No frames available in labelled window")
+    ext_start = max(0, start_idx - int(max(0, pad_frames)))
+    ext_end = min(frame_count - 1, end_idx + int(max(0, pad_frames)))
+    ext_indices = list(range(ext_start, ext_end + 1))
+    if product not in {"gtsm", "side_by_side"}:
+        return ext_indices
+
+    extra_indices = [i for i in ext_indices if i < start_idx or i > end_idx]
+    if not extra_indices:
+        return ext_indices
+    # User requirement: extend by +3 only when those extra GTSM PNGs are already cached.
+    if all(_gtsm_frame_cache_path(session, i).exists() for i in extra_indices):
+        return ext_indices
+    return base_indices
+
+
+def _gtsm_png_bytes_for_index(session: dict, time_index: int) -> bytes:
+    out_path = _gtsm_frame_cache_path(session, time_index)
+    if not out_path.exists():
+        subset_path = _resolve_path(session.get("gtsm_subset_path"))
+        if not subset_path or not subset_path.exists():
+            subset_path = _build_session_gtsm_subset(session)
+        if not subset_path or not subset_path.exists():
+            raise HTTPException(status_code=404, detail="No matching GTSM subset available for this window")
+        frame_list = session.get("frame_list") or []
+        _, ts = frame_list[time_index]
+        rendered = _render_gtsm_frame_from_subset(
+            subset_path,
+            pd.Timestamp(ts),
+            out_path,
+            time_index=time_index,
+            total_steps=len(frame_list),
+        )
+        if not rendered or not out_path.exists():
+            raise HTTPException(status_code=404, detail="No matching GTSM frame available for this timestamp")
+    return out_path.read_bytes()
+
+
+def _to_rgb_frame(frame: np.ndarray) -> np.ndarray:
+    arr = np.asarray(frame)
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    if arr.ndim != 3:
+        raise HTTPException(status_code=500, detail="Invalid frame dimensions for export")
+    if arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+    if arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+def _compose_side_by_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    l = _to_rgb_frame(left)
+    r = _to_rgb_frame(right)
+    h = max(l.shape[0], r.shape[0])
+    w = l.shape[1] + r.shape[1]
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    out[: l.shape[0], : l.shape[1], :] = l
+    out[: r.shape[0], l.shape[1] : l.shape[1] + r.shape[1], :] = r
+    return out
+
+
+def _encode_animation(frames: list[np.ndarray], target_path: Path, fmt: str, fps: int) -> None:
+    if not frames:
+        raise HTTPException(status_code=400, detail="No frames to export")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fps = int(max(1, min(30, fps)))
+    rgb_frames = [_to_rgb_frame(f) for f in frames]
+    try:
+        if fmt == "gif":
+            duration = 1.0 / float(fps)
+            imageio.mimsave(target_path, rgb_frames, format="GIF", duration=duration, loop=0)
+            return
+        if fmt == "mp4":
+            with imageio.get_writer(
+                target_path,
+                fps=fps,
+                format="FFMPEG",
+                codec="libx264",
+                macro_block_size=None,
+            ) as writer:
+                for frame in rgb_frames:
+                    writer.append_data(frame)
+            return
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to encode {fmt.upper()} export: {exc}")
+    raise HTTPException(status_code=400, detail=f"Unsupported export format: {fmt}")
+
+
 @app.get("/api/gtsm/frame/{session_id}/{time_index}")
 async def api_gtsm_frame(session_id: str, time_index: int):
     session = get_session(session_id)
@@ -1120,20 +1294,62 @@ async def api_gtsm_frame(session_id: str, time_index: int):
         end_iso = _normalize_iso_utc(pd.Timestamp(frame_list[-1][1]).isoformat())
     if not start_iso or not end_iso:
         raise HTTPException(status_code=500, detail="Unable to resolve session window for GTSM")
-    win_key = _window_key(start_iso, end_iso)
-    out_dir = _storm_gtsm_dir(int(storm_id)) / win_key
-    out_name = f"gtsm_{_window_token(_normalize_iso_utc(ts_pd.isoformat()) or ts_pd.strftime('%Y%m%dT%H%M%SZ'))}.png"
-    out_path = out_dir / out_name
+    out_path = _gtsm_frame_cache_path(session, time_index)
     if not out_path.exists():
         subset_path = _resolve_path(session.get("gtsm_subset_path"))
         if not subset_path or not subset_path.exists():
             subset_path = _build_session_gtsm_subset(session)
         if not subset_path or not subset_path.exists():
             raise HTTPException(status_code=404, detail="No matching GTSM subset available for this window")
-        rendered = _render_gtsm_frame_from_subset(subset_path, ts_pd, out_path)
+        rendered = _render_gtsm_frame_from_subset(
+            subset_path,
+            ts_pd,
+            out_path,
+            time_index=time_index,
+            total_steps=len(frame_list),
+        )
         if not rendered:
             raise HTTPException(status_code=404, detail="No matching GTSM frame available for this timestamp")
     return FileResponse(out_path, media_type="image/png")
+
+
+@app.post("/api/export/{session_id}")
+async def api_export_animation(session_id: str, body: ExportBody):
+    session = get_session(session_id)
+    session["last_access"] = time.time()
+    if not (session.get("track") or []):
+        raise HTTPException(status_code=400, detail="Track is empty; cannot export labelled window")
+    fps = int(max(1, min(30, body.fps)))
+    product = str(body.product)
+    fmt = str(body.format)
+    frame_indices = _resolve_export_indices(session, product, pad_frames=3)
+    if not frame_indices:
+        raise HTTPException(status_code=400, detail="No frames available for export")
+
+    frames: list[np.ndarray] = []
+    for idx in frame_indices:
+        if product == "era5":
+            era_png = render_frame(session, idx, session.get("track") or [])
+            frames.append(imageio.imread(io.BytesIO(era_png), format="png"))
+        elif product == "gtsm":
+            gtsm_png = _gtsm_png_bytes_for_index(session, idx)
+            frames.append(imageio.imread(io.BytesIO(gtsm_png), format="png"))
+        elif product == "side_by_side":
+            era_png = render_frame(session, idx, session.get("track") or [])
+            gtsm_png = _gtsm_png_bytes_for_index(session, idx)
+            frames.append(
+                _compose_side_by_side(
+                    imageio.imread(io.BytesIO(era_png), format="png"),
+                    imageio.imread(io.BytesIO(gtsm_png), format="png"),
+                )
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported export product: {product}")
+
+    out_path = _export_path_for_session(session, session_id, product, fmt, frame_indices, fps)
+    _encode_animation(frames, out_path, fmt, fps)
+    media_type = "image/gif" if fmt == "gif" else "video/mp4"
+    return FileResponse(out_path, media_type=media_type, filename=out_path.name)
 
 
 @app.get("/api/track/{session_id}")

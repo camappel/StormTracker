@@ -28,7 +28,8 @@
     lastAutoStartKey: null,
     autoStartRequestId: 0,
     gtsmAvailable: false,
-    trackDirty: false
+    trackDirty: false,
+    exportBusy: false
   };
 
   const stormSelect = document.getElementById('storm-select');
@@ -59,6 +60,10 @@
   const clickLayer = document.getElementById('click-layer');
   const timeWindowSliderEl = document.getElementById('time-window-slider');
   const btnUpdateTrack = document.getElementById('btn-update-track');
+  const exportFormatSelect = document.getElementById('export-format-select');
+  const btnExportEra5 = document.getElementById('btn-export-era5');
+  const btnExportGtsm = document.getElementById('btn-export-gtsm');
+  const btnExportSideBySide = document.getElementById('btn-export-side-by-side');
   const trackInfo = document.getElementById('track-info');
   function showError(msg) {
     uploadError.textContent = msg;
@@ -306,8 +311,13 @@
 
   function updateTrackButtonState() {
     const n = state.track.length;
-    btnUpdateTrack.disabled = !state.sessionId || n === 0;
+    const canActOnTrack = !!state.sessionId && n > 0;
+    btnUpdateTrack.disabled = !canActOnTrack;
     btnUpdateTrack.classList.toggle('track-update-dirty', n > 0 && state.trackDirty);
+    const exportDisabled = !canActOnTrack || state.exportBusy;
+    [btnExportEra5, btnExportGtsm, btnExportSideBySide].forEach((btn) => {
+      if (btn) btn.disabled = exportDisabled;
+    });
   }
 
   function updateTrackInfo() {
@@ -317,7 +327,7 @@
     } else if (state.trackDirty) {
       trackInfo.textContent = `${n} track point(s). Click "Update Storm Track" to persist changes.`;
     } else {
-      trackInfo.textContent = `${n} track point(s). Storm track is up to date.`;
+      trackInfo.textContent = `${n} track point(s).`;
     }
     updateTrackButtonState();
   }
@@ -351,6 +361,60 @@
     }
     clearError();
     return res.json();
+  }
+
+  function setExportBusy(isBusy) {
+    state.exportBusy = !!isBusy;
+    updateTrackButtonState();
+  }
+
+  function pickDownloadFileName(res, fallbackName) {
+    const cd = res.headers.get('content-disposition') || '';
+    const m = cd.match(/filename\*?=(?:UTF-8''|")?([^\";]+)/i);
+    if (!m || !m[1]) return fallbackName;
+    return decodeURIComponent(m[1]).replace(/"/g, '').trim() || fallbackName;
+  }
+
+  async function exportAnimation(product) {
+    if (!state.sessionId || !state.track.length || state.exportBusy) return;
+    const format = (exportFormatSelect && exportFormatSelect.value) ? exportFormatSelect.value : 'gif';
+    const label = product === 'side_by_side' ? 'side-by-side' : product.toUpperCase();
+    try {
+      setExportBusy(true);
+      clearError();
+      showApiStatus(`Generating ${label} ${format.toUpperCase()}...`);
+      const res = await fetch(`${API}/api/export/${state.sessionId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          product,
+          format
+        })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        showError(err.detail || `Failed to export ${label}`);
+        clearApiStatus();
+        return;
+      }
+      const blob = await res.blob();
+      const fallback = `${product}.${format}`;
+      const fileName = pickDownloadFileName(res, fallback);
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(href);
+      showApiStatus(`Downloaded ${fileName}`);
+    } catch (e) {
+      clearApiStatus();
+      showError('Network error: ' + e.message);
+    } finally {
+      setExportBusy(false);
+    }
   }
 
   function loadFrame() {
@@ -712,7 +776,7 @@
       options: {
         responsive: true,
         maintainAspectRatio: true,
-        aspectRatio: 1.5,
+        aspectRatio: 1.1,
         interaction: { intersect: false, mode: 'index' },
         scales: {
           x: {
@@ -833,6 +897,7 @@
     state.timeIndex = 0;
     state.lastAutoStartKey = null;
     state.trackDirty = false;
+    state.exportBusy = false;
     state.waterSeries = [];
     state.stormWindows = [];
     commitEra5Window('', '');
@@ -1029,6 +1094,24 @@
       updateTrackInfo();
     }
   });
+
+  if (btnExportEra5) {
+    btnExportEra5.addEventListener('click', () => {
+      exportAnimation('era5');
+    });
+  }
+
+  if (btnExportGtsm) {
+    btnExportGtsm.addEventListener('click', () => {
+      exportAnimation('gtsm');
+    });
+  }
+
+  if (btnExportSideBySide) {
+    btnExportSideBySide.addEventListener('click', () => {
+      exportAnimation('side_by_side');
+    });
+  }
 
   if (chartRangeStartSelect) {
     chartRangeStartSelect.addEventListener('change', handleChartRangeSelectionChange);

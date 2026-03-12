@@ -82,7 +82,7 @@ header h1 {
 
 .chart-wrap canvas {
   display: block;
-  max-height: 540px;
+  max-height: 700px;
   margin-bottom: 0.5rem;
 }
 
@@ -227,8 +227,13 @@ header h1 {
 .era5-action-row {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 0.5rem;
   margin-top: 0.25rem;
+}
+
+#export-format-select {
+  min-width: 5.5rem;
 }
 
 .mode-controls label {
@@ -307,6 +312,14 @@ header h1 {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+
+.map-export-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
 }
 
 .gtsm-container {

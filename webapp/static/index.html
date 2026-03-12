@@ -87,6 +87,16 @@
                 <img id="gtsm-frame-img" alt="GTSM surge frame" />
               </div>
             </div>
+            <div class="map-export-row">
+              <label for="export-format-select">Export format</label>
+              <select id="export-format-select" aria-label="Export format">
+                <option value="gif">GIF</option>
+                <option value="mp4">MP4</option>
+              </select>
+              <button type="button" id="btn-export-era5" class="button secondary-button" disabled>Export ERA5</button>
+              <button type="button" id="btn-export-gtsm" class="button secondary-button" disabled>Export GTSM</button>
+              <button type="button" id="btn-export-side-by-side" class="button secondary-button" disabled>Export Side-by-side</button>
+            </div>
             <p id="track-info"></p>
             <div id="frame-window-status" class="window-labels">
               <div><strong>First frame:</strong> <span id="active-first-frame">—</span></div>
