@@ -9,7 +9,6 @@
     times: [],
     timeIndex: 0,
     track: [],
-    mode: 'add',
     storms: [],
     selectedStormId: null,
     waterSeries: [],
@@ -21,7 +20,6 @@
     activeStartIdx: 0,
     activeEndIdx: 0,
     waterTideChart: null,
-    surgeChart: null,
     era5StartUtc: null,
     era5EndUtc: null,
     plotStartUtc: null,
@@ -29,7 +27,8 @@
     sliderInternalUpdate: false,
     lastAutoStartKey: null,
     autoStartRequestId: 0,
-    gtsmAvailable: false
+    gtsmAvailable: false,
+    trackDirty: false
   };
 
   const stormSelect = document.getElementById('storm-select');
@@ -40,7 +39,6 @@
   const waterLevelChartWrap = document.getElementById('water-level-chart-wrap');
   const chartRangeSection = document.getElementById('chart-range-section');
   const waterTideChartCanvas = document.getElementById('water-tide-chart');
-  const surgeChartCanvas = document.getElementById('surge-chart');
   const era5WindowSection = document.getElementById('era5-window-section');
   const chartRangeStartSelect = document.getElementById('chart-range-start');
   const chartRangeEndSelect = document.getElementById('chart-range-end');
@@ -60,9 +58,7 @@
   const gtsmFrameImg = document.getElementById('gtsm-frame-img');
   const clickLayer = document.getElementById('click-layer');
   const timeWindowSliderEl = document.getElementById('time-window-slider');
-  const btnDownload = document.getElementById('btn-download');
-  const btnSaveCombined = document.getElementById('btn-save-combined');
-  const btnDownloadCombined = document.getElementById('btn-download-combined');
+  const btnUpdateTrack = document.getElementById('btn-update-track');
   const trackInfo = document.getElementById('track-info');
   function showError(msg) {
     uploadError.textContent = msg;
@@ -107,8 +103,38 @@
     return { lon, lat };
   }
 
-  function updateTimeLabel() {
-    // Current frame is represented by map image + center slider handle.
+  function lonLatToPixel(lon, lat) {
+    const b = state.bounds;
+    if (!b) return null;
+    const rect = frameImg.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+    if (w <= 0 || h <= 0) return null;
+    const fracX = (Number(lon) - b.lon_min) / (b.lon_max - b.lon_min);
+    const fracY = (b.lat_max - Number(lat)) / (b.lat_max - b.lat_min);
+    return {
+      x: rect.left + fracX * w,
+      y: rect.top + fracY * h
+    };
+  }
+
+  function getClickedTrackPointTimeIndex(x, y) {
+    if (!state.track || state.track.length === 0) return null;
+    const hitRadiusPx = 10;
+    const hitRadiusSq = hitRadiusPx * hitRadiusPx;
+    let best = null;
+    state.track.forEach((p) => {
+      const pt = lonLatToPixel(p.lon, p.lat);
+      if (!pt) return;
+      const dx = x - pt.x;
+      const dy = y - pt.y;
+      const distSq = dx * dx + dy * dy;
+      if (distSq > hitRadiusSq) return;
+      if (!best || distSq < best.distSq) {
+        best = { time_index: p.time_index, distSq };
+      }
+    });
+    return best ? best.time_index : null;
   }
 
   function sliderTooltipForIndex(idx) {
@@ -183,9 +209,36 @@
     updateChartViewport(nextStart, nextEnd);
   }
 
+  function forEachChart(callback) {
+    [state.waterTideChart].forEach((chart) => {
+      if (chart) callback(chart);
+    });
+  }
+
+  function makeVerticalLineAnnotation(xIso, color, labelText, showLabel) {
+    return {
+      type: 'line',
+      xMin: xIso,
+      xMax: xIso,
+      borderColor: color,
+      borderWidth: 2,
+      borderDash: [0, 0],
+      label: showLabel ? {
+        display: true,
+        content: labelText,
+        position: 'start',
+        backgroundColor: 'rgba(255,255,255,0.8)',
+        color: '#222',
+        padding: 2,
+        yAdjust: 0
+      } : {
+        display: false
+      }
+    };
+  }
+
   function updateEra5LineAnnotations(startIso, endIso) {
-    const charts = [state.waterTideChart, state.surgeChart];
-    charts.forEach((chart) => {
+    forEachChart((chart) => {
       if (!chart || !chart.options || !chart.options.plugins || !chart.options.plugins.annotation) return;
       const anns = chart.options.plugins.annotation.annotations || {};
       if (startIso && anns['era5-start-line']) {
@@ -198,10 +251,6 @@
       }
       chart.update('none');
     });
-  }
-
-  function lockOuterSliderHandles() {
-    // Single-handle slider now controls only current frame.
   }
 
   function ensureWindowSlider() {
@@ -219,7 +268,6 @@
         from: (v) => Number(v)
       }
     });
-    lockOuterSliderHandles();
     timeWindowSliderEl.noUiSlider.on('update', (values) => {
       if (state.sliderInternalUpdate || !state.times.length) return;
       const n = state.times.length;
@@ -229,7 +277,6 @@
       if (currentIdx < startIdx) currentIdx = startIdx;
       if (currentIdx > endIdx) currentIdx = endIdx;
       state.timeIndex = currentIdx;
-      updateTimeLabel();
       updateFrameWindowStatus();
       updateCurrentFrameMarker();
       loadFrame();
@@ -255,25 +302,55 @@
     slider.updateOptions({ range: { min: 0, max: Math.max(1, n - 1) } }, false);
     slider.set([state.timeIndex]);
     state.sliderInternalUpdate = false;
-    lockOuterSliderHandles();
+  }
+
+  function updateTrackButtonState() {
+    const n = state.track.length;
+    btnUpdateTrack.disabled = !state.sessionId || n === 0;
+    btnUpdateTrack.classList.toggle('track-update-dirty', n > 0 && state.trackDirty);
   }
 
   function updateTrackInfo() {
     const n = state.track.length;
-    trackInfo.textContent = n === 0
-      ? 'No track points. Click on map in "Add point" mode to add.'
-      : `${n} track point(s). Save to combined CSV when done.`;
-    btnSaveCombined.disabled = !state.sessionId || n === 0;
+    if (n === 0) {
+      trackInfo.textContent = 'No track points. Click on the map to add points.';
+    } else if (state.trackDirty) {
+      trackInfo.textContent = `${n} track point(s). Click "Update Storm Track" to persist changes.`;
+    } else {
+      trackInfo.textContent = `${n} track point(s). Storm track is up to date.`;
+    }
+    updateTrackButtonState();
   }
 
-  function updateDownloadLink() {
-    if (!state.sessionId) {
-      btnDownload.href = '#';
-      btnDownload.style.visibility = 'hidden';
-      return;
+  function setTrackAndRefresh(track, options = {}) {
+    const wasSessionActive = !!state.sessionId;
+    state.track = track || [];
+    if (options.markDirty) {
+      state.trackDirty = true;
+    } else if (options.markUpdated) {
+      state.trackDirty = false;
+    } else if (!wasSessionActive) {
+      state.trackDirty = false;
     }
-    btnDownload.href = `${API}/api/csv/${state.sessionId}`;
-    btnDownload.style.visibility = 'visible';
+    updateTrackInfo();
+    if (options.reloadFrame) loadFrame();
+  }
+
+  async function postTrackAction(endpoint, payload, errorMessage) {
+    const res = await fetch(`${API}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      if (errorMessage) {
+        showError(err.detail || errorMessage);
+      }
+      return null;
+    }
+    clearError();
+    return res.json();
   }
 
   function loadFrame() {
@@ -295,67 +372,34 @@
     const res = await fetch(`${API}/api/track/${state.sessionId}`);
     if (!res.ok) return;
     const data = await res.json();
-    state.track = data.track || [];
-    updateTrackInfo();
-    updateDownloadLink();
+    setTrackAndRefresh(data.track);
   }
 
   async function addPoint(lon, lat) {
-    const res = await fetch(`${API}/api/track/add`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const data = await postTrackAction(
+      '/api/track/add',
+      {
         session_id: state.sessionId,
         time_index: state.timeIndex,
         lon,
         lat
-      })
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      showError(err.detail || 'Failed to add point');
-      return;
-    }
-    clearError();
-    const data = await res.json();
-    state.track = data.track || [];
-    updateTrackInfo();
-    updateDownloadLink();
-    loadFrame();
+      },
+      'Failed to add point'
+    );
+    if (!data) return;
+    setTrackAndRefresh(data.track, { reloadFrame: true, markDirty: true });
   }
 
   async function deletePoint(timeIndex) {
-    const res = await fetch(`${API}/api/track/delete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const data = await postTrackAction(
+      '/api/track/delete',
+      {
         session_id: state.sessionId,
         time_index: timeIndex
-      })
-    });
-    if (!res.ok) return;
-    const data = await res.json();
-    state.track = data.track || [];
-    updateTrackInfo();
-    updateDownloadLink();
-    loadFrame();
-  }
-
-  async function deleteLastPoint() {
-    const res = await fetch(`${API}/api/track/delete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: state.sessionId,
-        time_index: -1
-      })
-    });
-    if (!res.ok) return;
-    const data = await res.json();
-    state.track = data.track || [];
-    updateTrackInfo();
-    updateDownloadLink();
-    loadFrame();
+      }
+    );
+    if (!data) return;
+    setTrackAndRefresh(data.track, { reloadFrame: true, markDirty: true });
   }
 
   function formatIsoForDisplay(isoString) {
@@ -553,8 +597,7 @@
 
   function updateChartViewport(minUtc, maxUtc) {
     if (!minUtc || !maxUtc) return;
-    const charts = [state.waterTideChart, state.surgeChart];
-    charts.forEach((chart) => {
+    forEachChart((chart) => {
       if (!chart) return;
       if (chart.options.scales && chart.options.scales.x) {
         chart.options.scales.x.min = minUtc;
@@ -571,28 +614,17 @@
       markerIso = current && current.time_utc ? current.time_utc : null;
     }
     if (!markerIso) return;
-    const charts = [state.waterTideChart, state.surgeChart];
-    charts.forEach((chart) => {
+    forEachChart((chart) => {
       if (!chart || !chart.options || !chart.options.plugins || !chart.options.plugins.annotation) return;
       if (!chart.options.plugins.annotation.annotations) {
         chart.options.plugins.annotation.annotations = {};
       }
-      chart.options.plugins.annotation.annotations['current-frame-line'] = {
-        type: 'line',
-        xMin: markerIso,
-        xMax: markerIso,
-        borderColor: 'rgba(220, 0, 0, 0.95)',
-        borderWidth: 2,
-        borderDash: [0, 0],
-        label: {
-          display: true,
-          content: 'Current Frame',
-          position: 'start',
-          backgroundColor: 'rgba(255,255,255,0.8)',
-          color: '#222',
-          padding: 2
-        }
-      };
+      chart.options.plugins.annotation.annotations['current-frame-line'] = makeVerticalLineAnnotation(
+        markerIso,
+        'rgba(220, 0, 0, 0.95)',
+        'Current Frame',
+        true
+      );
       chart.update('none');
     });
   }
@@ -601,10 +633,6 @@
     if (state.waterTideChart) {
       state.waterTideChart.destroy();
       state.waterTideChart = null;
-    }
-    if (state.surgeChart) {
-      state.surgeChart.destroy();
-      state.surgeChart = null;
     }
   }
 
@@ -639,25 +667,7 @@
     const markerIso = currentPoint && currentPoint.time_utc ? currentPoint.time_utc : null;
     const addLine = function (target, key, xIso, color, labelText, withLabel) {
       if (!xIso) return;
-      target[key] = {
-        type: 'line',
-        xMin: xIso,
-        xMax: xIso,
-        borderColor: color,
-        borderWidth: 2,
-        borderDash: [0, 0],
-        label: withLabel ? {
-          display: true,
-          content: labelText,
-          position: 'start',
-          backgroundColor: 'rgba(255,255,255,0.8)',
-          color: '#222',
-          padding: 2,
-          yAdjust: 0
-        } : {
-          display: false
-        }
-      };
+      target[key] = makeVerticalLineAnnotation(xIso, color, labelText, withLabel);
     };
     const era5Start = state.era5StartUtc;
     const era5End = state.era5EndUtc;
@@ -677,22 +687,12 @@
       waterAnnotations['storm-window-' + i] = box;
     });
     if (markerIso) {
-      const markerAnn = {
-        type: 'line',
-        xMin: markerIso,
-        xMax: markerIso,
-        borderColor: 'rgba(220, 0, 0, 0.95)',
-        borderWidth: 2,
-        borderDash: [0, 0],
-        label: {
-          display: true,
-          content: 'Current Frame',
-          position: 'start',
-          backgroundColor: 'rgba(255,255,255,0.8)',
-          color: '#222',
-          padding: 2
-        }
-      };
+      const markerAnn = makeVerticalLineAnnotation(
+        markerIso,
+        'rgba(220, 0, 0, 0.95)',
+        'Current Frame',
+        true
+      );
       waterAnnotations['current-frame-line'] = markerAnn;
     }
     const waterCtx = waterTideChartCanvas.getContext('2d');
@@ -785,16 +785,12 @@
     } else {
       state.timeIndex = state.activeStartIdx;
     }
-    state.track = [];
     mapSection.hidden = false;
     updateSlider();
-    updateTimeLabel();
     updateFrameWindowStatus();
     updateCurrentFrameMarker();
-    updateTrackInfo();
-    updateDownloadLink();
+    setTrackAndRefresh(data.track || [], { markUpdated: (data.track || []).length > 0 });
     loadFrame();
-    fetchTrack();
   }
 
   async function loadStormCatalog() {
@@ -822,6 +818,61 @@
     }
   }
 
+  function resetSessionState() {
+    destroyWaterCharts();
+    destroyWindowSlider();
+    state.sessionId = null;
+    state.times = [];
+    state.activeStartIdx = 0;
+    state.activeEndIdx = 0;
+    state.barrierStartUtc = null;
+    state.barrierEndUtc = null;
+    state.defaultCurrentUtc = null;
+    state.plotStartUtc = null;
+    state.plotEndUtc = null;
+    state.timeIndex = 0;
+    state.lastAutoStartKey = null;
+    state.trackDirty = false;
+    state.waterSeries = [];
+    state.stormWindows = [];
+    commitEra5Window('', '');
+    setTrackAndRefresh([]);
+  }
+
+  function resetStormUiState() {
+    waterLevelPlaceholder.hidden = false;
+    if (waterLevelLoading) waterLevelLoading.hidden = true;
+    if (waterLevelError) {
+      waterLevelError.hidden = true;
+      waterLevelError.textContent = '';
+    }
+    waterLevelChartWrap.hidden = true;
+    if (chartRangeSection) chartRangeSection.hidden = true;
+    era5WindowSection.hidden = true;
+    mapSection.hidden = true;
+    if (chartRangeStartSelect) chartRangeStartSelect.value = '';
+    if (chartRangeEndSelect) chartRangeEndSelect.value = '';
+    if (activeFirstFrameEl) activeFirstFrameEl.textContent = '—';
+    if (activeCurrentFrameEl) activeCurrentFrameEl.textContent = '—';
+    if (activeLastFrameEl) activeLastFrameEl.textContent = '—';
+    if (activeFrameCountEl) activeFrameCountEl.textContent = '0';
+  }
+
+  function setWaterSeriesLoadingState(isLoading) {
+    if (waterLevelLoading) waterLevelLoading.hidden = !isLoading;
+    if (waterLevelError && isLoading) {
+      waterLevelError.hidden = true;
+      waterLevelError.textContent = '';
+    }
+  }
+
+  function showWaterSeriesError(message) {
+    if (waterLevelError) {
+      waterLevelError.textContent = message;
+      waterLevelError.hidden = false;
+    }
+  }
+
   function updateStormDetails() {
     const sid = Number(stormSelect.value);
     const s = state.storms.find((st) => Number(st.storm_id) === sid);
@@ -841,36 +892,8 @@
       <div><strong>Storm:</strong> ${s.storm || s.label}</div>
       <div><strong>Closure window (UTC):</strong> ${formatIsoForDisplay(s.storm_start_local)} - ${formatIsoForDisplay(s.storm_end_local)}${hoursText}</div>
     `;
-    waterLevelPlaceholder.hidden = false;
-    if (waterLevelLoading) waterLevelLoading.hidden = true;
-    if (waterLevelError) { waterLevelError.hidden = true; waterLevelError.textContent = ''; }
-    waterLevelChartWrap.hidden = true;
-    if (chartRangeSection) chartRangeSection.hidden = true;
-    era5WindowSection.hidden = true;
-    mapSection.hidden = true;
-    destroyWaterCharts();
-    destroyWindowSlider();
-    state.sessionId = null;
-    state.times = [];
-    state.activeStartIdx = 0;
-    state.activeEndIdx = 0;
-    state.barrierStartUtc = null;
-    state.barrierEndUtc = null;
-    state.defaultCurrentUtc = null;
-    state.plotStartUtc = null;
-    state.plotEndUtc = null;
-    state.timeIndex = 0;
-    state.track = [];
-    state.lastAutoStartKey = null;
-    state.waterSeries = [];
-    state.stormWindows = [];
-    commitEra5Window('', '');
-    if (chartRangeStartSelect) chartRangeStartSelect.value = '';
-    if (chartRangeEndSelect) chartRangeEndSelect.value = '';
-    if (activeFirstFrameEl) activeFirstFrameEl.textContent = '—';
-    if (activeCurrentFrameEl) activeCurrentFrameEl.textContent = '—';
-    if (activeLastFrameEl) activeLastFrameEl.textContent = '—';
-    if (activeFrameCountEl) activeFrameCountEl.textContent = '0';
+    resetSessionState();
+    resetStormUiState();
 
     const hasSeries = s.has_water_level_series !== false;
     if (!hasSeries) {
@@ -886,12 +909,11 @@
     destroyWaterCharts();
     destroyWindowSlider();
     state.waterSeries = [];
-    if (waterLevelLoading) waterLevelLoading.hidden = false;
-    if (waterLevelError) waterLevelError.hidden = true;
+    setWaterSeriesLoadingState(true);
     const url = `${API}/api/storms/${sid}/water_level_series`;
     fetch(url)
       .then(function (res) {
-        if (waterLevelLoading) waterLevelLoading.hidden = true;
+        setWaterSeriesLoadingState(false);
         if (!res.ok) throw new Error('Could not load series');
         return res.json();
       })
@@ -900,7 +922,7 @@
         state.waterSeries = series;
         state.stormWindows = data.storm_windows || [];
         if (series.length === 0) {
-          if (waterLevelError) { waterLevelError.textContent = 'No water level data in window.'; waterLevelError.hidden = false; }
+          showWaterSeriesError('No water level data in window.');
           return;
         }
         if (chartRangeSection) chartRangeSection.hidden = false;
@@ -946,28 +968,33 @@
         }
       })
       .catch(function (e) {
-        if (waterLevelLoading) waterLevelLoading.hidden = true;
-        if (waterLevelError) { waterLevelError.textContent = e.message || 'Error loading series'; waterLevelError.hidden = false; }
+        setWaterSeriesLoadingState(false);
+        showWaterSeriesError(e.message || 'Error loading series');
       });
   }
 
-  document.querySelectorAll('input[name="mode"]').forEach((radio) => {
-    radio.addEventListener('change', () => { state.mode = radio.value; });
-  });
+  function handleChartRangeSelectionChange() {
+    if (!chartRangeStartSelect || !chartRangeEndSelect) return;
+    if (!chartRangeStartSelect.value || !chartRangeEndSelect.value) return;
+    const startIso = localInputValueToIso(chartRangeStartSelect.value);
+    const endIso = localInputValueToIso(chartRangeEndSelect.value);
+    if (!startIso || !endIso) return;
+    applyChartRange(startIso, endIso);
+    renderWaterLevelChart();
+  }
 
   clickLayer.addEventListener('click', (e) => {
     if (!state.sessionId || !state.bounds) return;
     const x = e.clientX;
     const y = e.clientY;
+    const hitTimeIndex = getClickedTrackPointTimeIndex(x, y);
+    if (hitTimeIndex !== null) {
+      deletePoint(hitTimeIndex);
+      return;
+    }
     const pt = pixelToLonLat(x, y);
     if (!pt) return;
-    if (state.mode === 'add') {
-      addPoint(pt.lon, pt.lat);
-    } else {
-      const idx = state.track.findIndex(p => p.time_index === state.timeIndex);
-      if (idx >= 0) deletePoint(state.timeIndex);
-      else deleteLastPoint();
-    }
+    addPoint(pt.lon, pt.lat);
   });
 
   frameImg.addEventListener('load', () => {
@@ -982,18 +1009,20 @@
     updateStormDetails();
   });
 
-  btnSaveCombined.addEventListener('click', async () => {
+  btnUpdateTrack.addEventListener('click', async () => {
     if (!state.sessionId || state.track.length === 0) return;
     try {
-      btnSaveCombined.disabled = true;
-      const res = await fetch(`${API}/api/combined/save/${state.sessionId}`, {
+      btnUpdateTrack.disabled = true;
+      const res = await fetch(`${API}/api/track/update/${state.sessionId}`, {
         method: 'POST'
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        showError(data.detail || 'Failed to save combined CSV');
+        showError(data.detail || 'Failed to update storm track');
         return;
       }
+      clearError();
+      setTrackAndRefresh(state.track, { markUpdated: true });
     } catch (e) {
       showError('Network error: ' + e.message);
     } finally {
@@ -1002,25 +1031,11 @@
   });
 
   if (chartRangeStartSelect) {
-    chartRangeStartSelect.addEventListener('change', () => {
-      if (!chartRangeStartSelect.value || !chartRangeEndSelect || !chartRangeEndSelect.value) return;
-      const startIso = localInputValueToIso(chartRangeStartSelect.value);
-      const endIso = localInputValueToIso(chartRangeEndSelect.value);
-      if (!startIso || !endIso) return;
-      applyChartRange(startIso, endIso);
-      renderWaterLevelChart();
-    });
+    chartRangeStartSelect.addEventListener('change', handleChartRangeSelectionChange);
   }
 
   if (chartRangeEndSelect) {
-    chartRangeEndSelect.addEventListener('change', () => {
-      if (!chartRangeEndSelect.value || !chartRangeStartSelect || !chartRangeStartSelect.value) return;
-      const startIso = localInputValueToIso(chartRangeStartSelect.value);
-      const endIso = localInputValueToIso(chartRangeEndSelect.value);
-      if (!startIso || !endIso) return;
-      applyChartRange(startIso, endIso);
-      renderWaterLevelChart();
-    });
+    chartRangeEndSelect.addEventListener('change', handleChartRangeSelectionChange);
   }
 
   if (btnEra5Apply) {

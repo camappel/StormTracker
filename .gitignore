@@ -1,2 +1,12 @@
 /data/
 master1.m
+.DS_Store
+*.pyc
+__pycache__/
+.venv/
+webapp/.venv/
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
+libs/

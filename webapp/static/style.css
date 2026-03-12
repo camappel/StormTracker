@@ -137,24 +137,6 @@ header h1 {
   color: #c00;
 }
 
-.window-sliders {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.window-sliders .field-row {
-  max-width: 100%;
-}
-
-.window-sliders input[type="range"] {
-  width: 100%;
-  max-width: 400px;
-  margin-right: 0.5rem;
-  vertical-align: middle;
-  accent-color: #069;
-}
-
 .placeholder {
   margin: 0.5rem 0;
   font-size: 0.9rem;
@@ -166,47 +148,6 @@ header h1 {
   flex-wrap: wrap;
   gap: 0.75rem 1rem;
   align-items: flex-end;
-}
-
-.field-row {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-}
-
-.field-row label {
-  font-size: 0.8rem;
-  font-weight: 600;
-}
-
-.field-row input[type="datetime-local"] {
-  padding: 0.25rem 0.4rem;
-  font-size: 0.9rem;
-}
-
-.upload-zone {
-  display: block;
-  border: 2px dashed #999;
-  border-radius: 8px;
-  padding: 2rem;
-  text-align: center;
-  background: #fff;
-  cursor: pointer;
-  transition: border-color 0.2s, background 0.2s;
-}
-
-.upload-zone:hover {
-  border-color: #666;
-  background: #fafafa;
-}
-
-.upload-zone.dragover {
-  border-color: #069;
-  background: #e8f4f8;
-}
-
-#upload-text {
-  color: #555;
 }
 
 .error {
@@ -234,17 +175,6 @@ header h1 {
   margin-bottom: 0.75rem;
 }
 
-.time-controls {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-#time-label {
-  min-width: 140px;
-  font-weight: 500;
-}
-
 .time-nav-row {
   margin-top: 0.75rem;
   padding: 0.5rem 0;
@@ -256,26 +186,6 @@ header h1 {
 #time-window-slider {
   flex: 1 1 auto;
   min-width: 220px;
-}
-
-.slider-btn {
-  flex-shrink: 0;
-  padding: 0.4rem 0.75rem;
-  font-size: 0.9rem;
-  cursor: pointer;
-  background: #069;
-  color: #fff;
-  border: none;
-  border-radius: 4px;
-}
-
-.slider-btn:hover:not(:disabled) {
-  background: #057;
-}
-
-.slider-btn:disabled {
-  background: #999;
-  cursor: not-allowed;
 }
 
 .era5-window-controls {
@@ -311,6 +221,13 @@ header h1 {
 
 #btn-era5-apply {
   align-self: flex-start;
+  margin-top: 0.25rem;
+}
+
+.era5-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
   margin-top: 0.25rem;
 }
 
@@ -363,6 +280,14 @@ header h1 {
   background: #b56500;
 }
 
+.secondary-button.track-update-dirty {
+  background: #d67a00;
+}
+
+.secondary-button.track-update-dirty:hover {
+  background: #b56500;
+}
+
 .button:disabled {
   background: #777;
   color: #ddd;
@@ -388,13 +313,7 @@ header h1 {
   min-height: 220px;
 }
 
-#frame-img {
-  display: block;
-  width: 100%;
-  height: auto;
-  vertical-align: top;
-}
-
+#frame-img,
 #gtsm-frame-img {
   display: block;
   width: 100%;

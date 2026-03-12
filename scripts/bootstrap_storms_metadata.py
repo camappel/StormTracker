@@ -10,17 +10,23 @@ Generates:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-ANALYSIS_OUTPUT_DIR = ROOT_DIR / "Objective1" / "3a_ANALYSIS_Python" / "output"
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+LEGACY_ANALYSIS_OUTPUT_DIR = PROJECT_DIR.parent / "Objective1" / "3a_ANALYSIS_Python" / "output"
+ANALYSIS_OUTPUT_DIR = Path(
+    os.getenv(
+        "STORMTRACKER_ANALYSIS_OUTPUT_DIR",
+        str(LEGACY_ANALYSIS_OUTPUT_DIR if LEGACY_ANALYSIS_OUTPUT_DIR.exists() else PROJECT_DIR / "data"),
+    )
+).expanduser()
 MAST1_PATH = ANALYSIS_OUTPUT_DIR / "mast1.pkl"
-ERA5_DIR = ROOT_DIR / "StormTracker" / "data" / "era5"
-DATA_DIR = ROOT_DIR / "StormTracker" / "data"
+DATA_DIR = Path(os.getenv("STORMTRACKER_DATA_DIR", str(PROJECT_DIR / "data"))).expanduser()
 STORMS_PATH = DATA_DIR / "storms.json"
 WATER_LEVEL_SERIES_PATH = DATA_DIR / "water_level_series.json"
 
@@ -45,8 +51,6 @@ def main() -> int:
     tip = np.asarray(payload["TIP"], dtype=float) if "TIP" in payload else np.full_like(wlp, np.nan)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ERA5_DIR.mkdir(parents=True, exist_ok=True)
-
     storms = []
     water = {"storms": {}}
     for sid in sorted(storm_df["Storm"].unique()):
@@ -79,7 +83,6 @@ def main() -> int:
                 "storm": storm_name,
                 "era5_window": {"start": default_start, "end": default_end},
                 "storm_window": {"start": None, "end": None},
-                "era5_path": str((ERA5_DIR / f"{storm_name}.nc").relative_to(ROOT_DIR)),
                 "closures": closures,
             }
         )

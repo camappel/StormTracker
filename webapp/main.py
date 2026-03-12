@@ -1,6 +1,6 @@
 """
 StormTracker ERA5 Web App — FastAPI backend.
-Upload ERA5 NetCDF, step through time, draw storm track by clicking, download CSV.
+Upload ERA5 NetCDF, step through time, draw storm track by clicking, update persisted track data.
 """
 import io
 import json
@@ -24,7 +24,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from scipy.interpolate import RegularGridInterpolator
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -41,19 +41,60 @@ YB_GTSM = [45, 60]
 SESSION_TTL = 3600
 
 # Paths
-ROOT_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT_DIR / "StormTracker" / "data"
-STORMS_PATH = DATA_DIR / "storms.json"
-WATER_LEVEL_SERIES_PATH = DATA_DIR / "water_level_series.json"
-ERA5_DIR = DATA_DIR / "era5"
-GTSM_DIR = DATA_DIR / "gtsm"
-CODEC_GTSM_DIRS = [
-    ROOT_DIR / "Objective1" / "2_DATA" / "3_CODEC_GTSM_API",
-    ROOT_DIR / "Objective1" / "2_Data" / "3_CODEC_GTSM_API",
+APP_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = APP_DIR.parent
+ROOT_DIR = PROJECT_DIR
+
+
+def _env_path(name: str, default: Path) -> Path:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return Path(raw).expanduser()
+
+
+def _env_path_list(name: str, defaults: list[Path]) -> list[Path]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return defaults
+    return [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
+
+
+LEGACY_OBJECTIVE_DIR = PROJECT_DIR.parent / "Objective1"
+DEFAULT_CODEC_GTSM_DIRS = [
+    PROJECT_DIR / "data" / "codec_gtsm",
+    LEGACY_OBJECTIVE_DIR / "2_DATA" / "3_CODEC_GTSM_API",
+    LEGACY_OBJECTIVE_DIR / "2_Data" / "3_CODEC_GTSM_API",
 ]
 
-ANALYSIS_OUTPUT_DIR = ROOT_DIR / "Objective1" / "3a_ANALYSIS_Python" / "output"
-COMBINED_TRACKS_PATH = ANALYSIS_OUTPUT_DIR / "storm_tracks_labeled_web.csv"
+DATA_DIR = _env_path("STORMTRACKER_DATA_DIR", PROJECT_DIR / "data")
+STORMS_PATH = DATA_DIR / "storms.json"
+WATER_LEVEL_SERIES_PATH = DATA_DIR / "water_level_series.json"
+CODEC_GTSM_DIRS = _env_path_list("STORMTRACKER_CODEC_GTSM_DIRS", DEFAULT_CODEC_GTSM_DIRS)
+
+
+def _storm_root_dir(storm_id: int) -> Path:
+    return DATA_DIR / f"storm_{int(storm_id)}"
+
+
+def _storm_era5_dir(storm_id: int) -> Path:
+    return _storm_root_dir(storm_id) / "era5"
+
+
+def _storm_gtsm_dir(storm_id: int) -> Path:
+    return _storm_root_dir(storm_id) / "gtsm"
+
+
+def _era5_file_name(start_iso: str, end_iso: str) -> str:
+    return f"ERA5_{_window_key(start_iso, end_iso)}.nc"
+
+
+def _gtsm_subset_file_name(start_iso: str, end_iso: str) -> str:
+    return f"GTSM_subset_{_window_key(start_iso, end_iso)}.nc"
+
+
+def _storm_track_file_name(start_iso: str, end_iso: str) -> str:
+    return f"track_{_window_key(start_iso, end_iso)}.json"
 
 app = FastAPI(title="StormTracker ERA5 Web App")
 app.add_middleware(
@@ -126,7 +167,13 @@ def _resolve_path(path_str: str | None) -> Path | None:
 
 
 def _rel_path_str(path: Path) -> str:
-    return str(path.relative_to(ROOT_DIR) if path.is_absolute() else path)
+    if not path.is_absolute():
+        return str(path)
+    try:
+        return str(path.relative_to(ROOT_DIR))
+    except ValueError:
+        # Keep absolute paths for externally configured storage roots.
+        return str(path)
 
 
 def _storm_int_from_name(storm_name: str) -> int:
@@ -158,25 +205,6 @@ def _load_storms_metadata() -> list[dict]:
                     "start": _normalize_iso_utc(storm_window.get("start")),
                     "end": _normalize_iso_utc(storm_window.get("end")),
                 },
-                "era5_path": str(row.get("era5_path") or ""),
-                "era5_files": [
-                    {
-                        "start": _normalize_iso_utc(item.get("start")),
-                        "end": _normalize_iso_utc(item.get("end")),
-                        "path": str(item.get("path") or ""),
-                    }
-                    for item in (row.get("era5_files") or [])
-                    if isinstance(item, dict)
-                ],
-                "gtsm_files": [
-                    {
-                        "start": _normalize_iso_utc(item.get("start")),
-                        "end": _normalize_iso_utc(item.get("end")),
-                        "path": str(item.get("path") or ""),
-                    }
-                    for item in (row.get("gtsm_files") or [])
-                    if isinstance(item, dict)
-                ],
                 "closures": [
                     {
                         "start": _normalize_iso_utc(c.get("start")),
@@ -191,7 +219,36 @@ def _load_storms_metadata() -> list[dict]:
 
 
 def _save_storms_metadata(rows: list[dict]) -> None:
-    _json_save(STORMS_PATH, rows)
+    # Persist storms.json in canonical minimal schema only.
+    normalized_rows = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("storm"):
+            continue
+        era5_window = row.get("era5_window") or {}
+        storm_window = row.get("storm_window") or {}
+        closures = row.get("closures") if isinstance(row.get("closures"), list) else []
+        normalized_rows.append(
+            {
+                "storm": str(row["storm"]),
+                "era5_window": {
+                    "start": _normalize_iso_utc(era5_window.get("start")),
+                    "end": _normalize_iso_utc(era5_window.get("end")),
+                },
+                "storm_window": {
+                    "start": _normalize_iso_utc(storm_window.get("start")),
+                    "end": _normalize_iso_utc(storm_window.get("end")),
+                },
+                "closures": [
+                    {
+                        "start": _normalize_iso_utc(c.get("start")),
+                        "end": _normalize_iso_utc(c.get("end")),
+                    }
+                    for c in closures
+                    if isinstance(c, dict)
+                ],
+            }
+        )
+    _json_save(STORMS_PATH, normalized_rows)
 
 
 def _find_storm_meta(storm_id: int) -> tuple[int, dict]:
@@ -205,40 +262,100 @@ def _find_storm_meta(storm_id: int) -> tuple[int, dict]:
     raise HTTPException(status_code=404, detail=f"Storm {storm_id} not found in storms.json")
 
 
-def _pick_default_window(meta: dict) -> tuple[str | None, str | None]:
-    storm_win = meta.get("storm_window") or {}
-    era5_win = meta.get("era5_window") or {}
-    start = storm_win.get("start") or era5_win.get("start")
-    end = storm_win.get("end") or era5_win.get("end")
-    return start, end
+def _storm_track_path(storm_id: int, start_iso: str, end_iso: str) -> Path:
+    sid = int(storm_id)
+    return _storm_root_dir(sid) / "storm_track" / _storm_track_file_name(start_iso, end_iso)
 
 
-def _upsert_window_file(meta_row: dict, key: str, start_iso: str, end_iso: str, path: Path) -> None:
-    files = meta_row.get(key)
-    if not isinstance(files, list):
-        files = []
-    rel = _rel_path_str(path)
-    replaced = False
-    for item in files:
-        if item.get("start") == start_iso and item.get("end") == end_iso:
-            item["path"] = rel
-            replaced = True
-            break
-    if not replaced:
-        files.append({"start": start_iso, "end": end_iso, "path": rel})
-    meta_row[key] = files
-
-
-def _has_exact_cached_file(meta: dict, key: str, start_iso: str | None, end_iso: str | None) -> bool:
-    if not start_iso or not end_iso:
-        return False
-    for item in meta.get(key) or []:
-        if item.get("start") != start_iso or item.get("end") != end_iso:
+def _serialise_track_for_storage(track: list[dict]) -> list[dict]:
+    out = []
+    for point in track:
+        time_utc = point.get("time_utc")
+        lon = point.get("lon")
+        lat = point.get("lat")
+        pressure_hpa = point.get("pressure_hpa")
+        if time_utc is None or lon is None or lat is None:
             continue
-        p = _resolve_path(item.get("path"))
-        if p and p.exists():
-            return True
-    return False
+        out.append(
+            {
+                "time_utc": str(time_utc),
+                "lon": round(float(lon), 6),
+                "lat": round(float(lat), 6),
+                "pressure_hpa": round(float(pressure_hpa), 2) if pressure_hpa is not None else None,
+            }
+        )
+    out.sort(key=lambda p: pd.Timestamp(p["time_utc"]))
+    return out
+
+
+def _normalise_stored_track_for_session(stored_track: list[dict], frame_list: list[tuple[int, pd.Timestamp]]) -> list[dict]:
+    if not stored_track or not frame_list:
+        return []
+
+    frame_lookup: dict[str, tuple[int, pd.Timestamp]] = {}
+    for frame_idx, (_, frame_time) in enumerate(frame_list):
+        key = pd.Timestamp(frame_time).strftime("%Y-%m-%d %H:%M:%S")
+        frame_lookup[key] = (frame_idx, pd.Timestamp(frame_time))
+
+    normalised = []
+    for point in stored_track:
+        if not isinstance(point, dict):
+            continue
+        raw_time = point.get("time_utc")
+        if raw_time is None:
+            continue
+        try:
+            ts = pd.Timestamp(raw_time)
+        except Exception:
+            continue
+        key = ts.strftime("%Y-%m-%d %H:%M:%S")
+        mapped = frame_lookup.get(key)
+        if not mapped:
+            continue
+        frame_idx, frame_ts = mapped
+        lon = point.get("lon")
+        lat = point.get("lat")
+        if lon is None or lat is None:
+            continue
+        pressure_hpa = point.get("pressure_hpa")
+        normalised.append(
+            {
+                "time_utc": frame_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                "time_index": frame_idx,
+                "lon": round(float(lon), 6),
+                "lat": round(float(lat), 6),
+                "pressure_hpa": round(float(pressure_hpa), 2) if pressure_hpa is not None else None,
+            }
+        )
+    normalised.sort(key=lambda p: p["time_index"])
+    return normalised
+
+
+def _load_persisted_track(
+    storm_id: int,
+    start_iso: str | None,
+    end_iso: str | None,
+    frame_list: list[tuple[int, pd.Timestamp]],
+) -> list[dict]:
+    if not start_iso or not end_iso:
+        return []
+    path = _storm_track_path(storm_id, start_iso, end_iso)
+    if not path.exists():
+        return []
+    payload = _json_load(path)
+    if not isinstance(payload, list):
+        return []
+    return _normalise_stored_track_for_session(payload, frame_list)
+
+
+def _pick_default_window(meta: dict) -> tuple[str | None, str | None]:
+    era5_win = meta.get("era5_window") or {}
+    return era5_win.get("start"), era5_win.get("end")
+
+
+def _era5_path_for_window(storm_id: int, start_iso: str, end_iso: str) -> Path:
+    sid = int(storm_id)
+    return _storm_era5_dir(sid) / _era5_file_name(start_iso, end_iso)
 
 
 def _load_water_level_series_all() -> dict:
@@ -282,6 +399,8 @@ def _get_storm_catalog() -> list[dict]:
                 "storm_id": sid,
                 "storm": storm["storm"],
                 "label": storm["storm"].replace("_", " ").title(),
+                "storm_start_utc": c_start,
+                "storm_end_utc": c_end,
                 "storm_start_local": c_start,
                 "storm_end_local": c_end,
                 "default_start_utc": default_start,
@@ -330,13 +449,9 @@ async def api_storm_water_level_series(
     default_start, default_end = _pick_default_window(meta)
     full_start = normalized[0]["time_utc"] if normalized else default_start
     full_end = normalized[-1]["time_utc"] if normalized else default_end
-    default_window_cached = _has_exact_cached_file(meta, "era5_files", default_start, default_end)
-    if not default_window_cached and default_start and default_end:
-        # Backward compatibility: legacy single era5_path + era5_window fields
-        legacy_match = (meta.get("era5_window") or {}).get("start") == default_start and (meta.get("era5_window") or {}).get("end") == default_end
-        if legacy_match:
-            lp = _resolve_path(meta.get("era5_path"))
-            default_window_cached = bool(lp and lp.exists())
+    default_window_cached = False
+    if default_start and default_end:
+        default_window_cached = _era5_path_for_window(storm_id, default_start, default_end).exists()
     return {
         "series": normalized,
         "full_series_start_utc": full_start,
@@ -600,14 +715,30 @@ def get_session(session_id: str):
     return sessions[session_id]
 
 
-def _create_session_from_era5(path: Path, storm_id: int | None = None) -> dict:
+def _create_session_from_era5(
+    path: Path,
+    storm_id: int | None = None,
+    window_start_utc: str | None = None,
+    window_end_utc: str | None = None,
+    track_window_start_utc: str | None = None,
+    track_window_end_utc: str | None = None,
+) -> dict:
     data = parse_era5(path)
+    track_start = track_window_start_utc or window_start_utc
+    track_end = track_window_end_utc or window_end_utc
+    persisted_track = (
+        _load_persisted_track(int(storm_id), track_start, track_end, data["frame_list"])
+        if storm_id is not None
+        else []
+    )
     session_id = uuid.uuid4().hex
     sessions[session_id] = {
         "path": path,
         "storm_id": int(storm_id) if storm_id is not None else None,
+        "window_start_utc": window_start_utc,
+        "window_end_utc": window_end_utc,
         **data,
-        "track": [],
+        "track": persisted_track,
         "last_access": time.time(),
     }
     frame_list = data["frame_list"]
@@ -618,6 +749,7 @@ def _create_session_from_era5(path: Path, storm_id: int | None = None) -> dict:
     return {
         "session_id": session_id,
         "times": times,
+        "track": persisted_track,
         "gtsm_available": any(p.exists() for p in CODEC_GTSM_DIRS),
         "bounds": {
             "lon_min": XB_MET[0],
@@ -635,17 +767,11 @@ class StartStormSessionBody(BaseModel):
 
 
 def _parse_iso_utc(dt_str: str) -> datetime:
-    try:
-        s = dt_str.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            # Backward compatibility: treat naive timestamps as UTC.
-            return dt
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    except Exception:
+    iso_utc = _normalize_iso_utc(dt_str)
+    if not iso_utc:
         raise HTTPException(status_code=400, detail=f"Invalid datetime format: {dt_str!r}")
+    dt = datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _build_era5_month_segments(start_dt: datetime, end_dt: datetime) -> list[dict]:
@@ -680,8 +806,7 @@ async def api_start_storm_session(body: StartStormSessionBody):
     Download ERA5 file for the given storm + time window and create a
     StormTracker session bound to that storm_id.
 
-    The ERA5 files are stored under the shared 2_DATA/4_ERA5_API directory so that
-    they remain available for the analysis notebook and this web app.
+    ERA5 files are stored under data/storm_<id>/era5 so they can be reused across sessions.
     """
     storm_id = int(body.storm_id)
     t_start = _parse_iso_utc(body.start_utc)
@@ -692,20 +817,11 @@ async def api_start_storm_session(body: StartStormSessionBody):
     win_key = _window_key(start_iso, end_iso)
 
     meta_rows = _load_storms_metadata()
-    meta_idx, meta = _find_storm_meta(storm_id)
-    ERA5_DIR.mkdir(parents=True, exist_ok=True)
-    target_era5_path = ERA5_DIR / f"ERA5_storm_{storm_id}_{win_key}.nc"
-    era5_path = None
-    for item in meta.get("era5_files") or []:
-        if item.get("start") == start_iso and item.get("end") == end_iso:
-            candidate = _resolve_path(item.get("path"))
-            if candidate and candidate.exists():
-                era5_path = candidate
-                break
-    if era5_path is None and meta.get("era5_window", {}).get("start") == start_iso and meta.get("era5_window", {}).get("end") == end_iso:
-        candidate = _resolve_path(meta.get("era5_path"))
-        if candidate and candidate.exists():
-            era5_path = candidate
+    meta_idx, meta_row = _find_storm_meta(storm_id)
+    storm_era5_dir = _storm_era5_dir(storm_id)
+    storm_era5_dir.mkdir(parents=True, exist_ok=True)
+    target_era5_path = _era5_path_for_window(storm_id, start_iso, end_iso)
+    era5_path = target_era5_path if target_era5_path.exists() else None
 
     if era5_path is None:
         era5_path = target_era5_path
@@ -737,7 +853,7 @@ async def api_start_storm_session(body: StartStormSessionBody):
                     "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
                     "format": "netcdf",
                 }
-                part_path = ERA5_DIR / f"ERA5_part_storm_{storm_id}_{win_key}_{i:02d}.nc"
+                part_path = storm_era5_dir / f"ERA5_part_storm_{storm_id}_{win_key}_{i:02d}.nc"
                 client.retrieve("reanalysis-era5-single-levels", request).download(str(part_path))
                 part_paths.append(part_path)
             valid_time_start = np.datetime64(t_start)
@@ -757,21 +873,22 @@ async def api_start_storm_session(body: StartStormSessionBody):
                 for p in part_paths:
                     p.unlink(missing_ok=True)
 
-    # Normalize cached naming so exact-window files always include full time tokens.
-    if era5_path != target_era5_path:
-        if not target_era5_path.exists():
-            target_era5_path.write_bytes(era5_path.read_bytes())
-        era5_path = target_era5_path
-
-    meta_rows[meta_idx]["era5_path"] = _rel_path_str(era5_path)
     meta_rows[meta_idx]["era5_window"] = {"start": start_iso, "end": end_iso}
-    _upsert_window_file(meta_rows[meta_idx], "era5_files", start_iso, end_iso, era5_path)
     _save_storms_metadata(meta_rows)
 
-    session_payload = _create_session_from_era5(era5_path, storm_id=storm_id)
+    track_window = meta_row.get("storm_window") if isinstance(meta_row.get("storm_window"), dict) else {}
+    track_window_start = _normalize_iso_utc(track_window.get("start"))
+    track_window_end = _normalize_iso_utc(track_window.get("end"))
+
+    session_payload = _create_session_from_era5(
+        era5_path,
+        storm_id=storm_id,
+        window_start_utc=start_iso,
+        window_end_utc=end_iso,
+        track_window_start_utc=track_window_start,
+        track_window_end_utc=track_window_end,
+    )
     sid = session_payload["session_id"]
-    sessions[sid]["window_start_utc"] = start_iso
-    sessions[sid]["window_end_utc"] = end_iso
     _build_session_gtsm_subset(sessions[sid])
     return session_payload
 
@@ -843,24 +960,11 @@ def _build_gtsm_subset_for_window(
     start_iso: str,
     end_iso: str,
     frame_times: list[pd.Timestamp],
-    meta_rows: list[dict],
-    meta_idx: int,
 ) -> Path | None:
-    # Reuse exact cached subset first.
-    meta_row = meta_rows[meta_idx]
-    for item in meta_row.get("gtsm_files") or []:
-        if item.get("start") == start_iso and item.get("end") == end_iso:
-            p = _resolve_path(item.get("path"))
-            if p and p.exists():
-                return p
-
-    win_key = _window_key(start_iso, end_iso)
-    subset_dir = GTSM_DIR / f"storm_{storm_id}"
+    subset_dir = _storm_gtsm_dir(storm_id)
     subset_dir.mkdir(parents=True, exist_ok=True)
-    subset_path = subset_dir / f"GTSM_subset_storm_{storm_id}_{win_key}.nc"
+    subset_path = subset_dir / _gtsm_subset_file_name(start_iso, end_iso)
     if subset_path.exists():
-        _upsert_window_file(meta_row, "gtsm_files", start_iso, end_iso, subset_path)
-        _save_storms_metadata(meta_rows)
         return subset_path
 
     month_targets: dict[tuple[int, int], list[pd.Timestamp]] = {}
@@ -915,8 +1019,6 @@ def _build_gtsm_subset_for_window(
     combined.to_netcdf(subset_path)
     combined.close()
 
-    _upsert_window_file(meta_row, "gtsm_files", start_iso, end_iso, subset_path)
-    _save_storms_metadata(meta_rows)
     return subset_path
 
 
@@ -993,9 +1095,7 @@ def _build_session_gtsm_subset(session: dict) -> Path | None:
     if not start_iso or not end_iso:
         return None
     frame_times = [pd.Timestamp(t) for _, t in (session.get("frame_list") or [])]
-    meta_rows = _load_storms_metadata()
-    meta_idx, _ = _find_storm_meta(int(storm_id))
-    subset = _build_gtsm_subset_for_window(int(storm_id), start_iso, end_iso, frame_times, meta_rows, meta_idx)
+    subset = _build_gtsm_subset_for_window(int(storm_id), start_iso, end_iso, frame_times)
     if subset:
         session["gtsm_subset_path"] = str(subset)
     return subset
@@ -1021,7 +1121,7 @@ async def api_gtsm_frame(session_id: str, time_index: int):
     if not start_iso or not end_iso:
         raise HTTPException(status_code=500, detail="Unable to resolve session window for GTSM")
     win_key = _window_key(start_iso, end_iso)
-    out_dir = GTSM_DIR / f"storm_{int(storm_id)}" / win_key
+    out_dir = _storm_gtsm_dir(int(storm_id)) / win_key
     out_name = f"gtsm_{_window_token(_normalize_iso_utc(ts_pd.isoformat()) or ts_pd.strftime('%Y%m%dT%H%M%SZ'))}.png"
     out_path = out_dir / out_name
     if not out_path.exists():
@@ -1092,29 +1192,8 @@ async def api_track_delete(body: TrackDeleteBody):
     return {"track": session["track"]}
 
 
-@app.get("/api/csv/{session_id}")
-async def api_csv(session_id: str):
-    session = get_session(session_id)
-    session["last_access"] = time.time()
-    track = session["track"]
-    storm_id = session.get("storm_id")
-    if not track:
-        csv_content = "storm_id,time_utc,lon,lat,pressure_hpa\n"
-    else:
-        df = pd.DataFrame(track)
-        df = df.rename(columns={"pressure_hpa": "pressure_hpa"})
-        df.insert(0, "storm_id", int(storm_id) if storm_id is not None else "")
-        df = df[["storm_id", "time_utc", "lon", "lat", "pressure_hpa"]]
-        csv_content = df.to_csv(index=False)
-    return StreamingResponse(
-        io.BytesIO(csv_content.encode("utf-8")),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=storm_track.csv"},
-    )
-
-
-def _labelled_window_indices(session: dict, pad_hours: int = 3) -> tuple[int, int]:
-    """Return (start_idx, end_idx) in frame_list covering labelled track ± pad_hours.
+def _labelled_window_indices(session: dict, pad_hours: int = 0) -> tuple[int, int]:
+    """Return (start_idx, end_idx) in frame_list covering labelled track (optionally padded).
 
     Clamps to available frame indices.
     """
@@ -1155,11 +1234,10 @@ def _labelled_window_indices(session: dict, pad_hours: int = 3) -> tuple[int, in
     return start_idx, end_idx
 
 
-@app.post("/api/combined/save/{session_id}")
-async def api_combined_save(session_id: str):
+@app.post("/api/track/update/{session_id}")
+async def api_track_update(session_id: str):
     """
-    Append this session's track to the combined labeled CSV, keyed by (storm_id, time_utc).
-    Existing rows for those keys are replaced.
+    Persist this session's track under data/storm_<id>/storm_track/<window>.json and refresh storm_window.
     """
     session = get_session(session_id)
     session["last_access"] = time.time()
@@ -1168,60 +1246,28 @@ async def api_combined_save(session_id: str):
         raise HTTPException(status_code=400, detail="Session is not associated with a storm_id")
     track = session.get("track") or []
     if not track:
-        raise HTTPException(status_code=400, detail="Track is empty; nothing to save")
+        raise HTTPException(status_code=400, detail="Track is empty; nothing to update")
 
-    new_df = pd.DataFrame(track)
-    new_df["storm_id"] = int(storm_id)
-    new_df = new_df[["storm_id", "time_utc", "lon", "lat", "pressure_hpa"]]
-    new_df["time_utc"] = pd.to_datetime(new_df["time_utc"])
-
-    if COMBINED_TRACKS_PATH.exists():
-        existing = pd.read_csv(COMBINED_TRACKS_PATH)
-        if not existing.empty:
-            existing["time_utc"] = pd.to_datetime(existing["time_utc"])
-            mask = existing["storm_id"] == int(storm_id)
-            existing = existing[~mask]
-            combined = pd.concat([existing, new_df], ignore_index=True)
-        else:
-            combined = new_df
-    else:
-        COMBINED_TRACKS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        combined = new_df
-
-    combined.sort_values(["storm_id", "time_utc"], inplace=True)
-    combined.to_csv(COMBINED_TRACKS_PATH, index=False)
-
-    # Persist derived storm_window = labelled frame range ±3h to storms.json
-    start_idx, end_idx = _labelled_window_indices(session, pad_hours=3)
+    # Persist derived storm_window = labelled frame range min..max.
+    start_idx, end_idx = _labelled_window_indices(session, pad_hours=0)
     frame_list = session["frame_list"]
     _, start_ts = frame_list[start_idx]
     _, end_ts = frame_list[end_idx]
     start_iso = pd.Timestamp(start_ts).to_pydatetime().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
     end_iso = pd.Timestamp(end_ts).to_pydatetime().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    track_path = _storm_track_path(int(storm_id), start_iso, end_iso)
+    track_path.parent.mkdir(parents=True, exist_ok=True)
+    _json_save(track_path, _serialise_track_for_storage(track))
     rows = _load_storms_metadata()
     idx, _ = _find_storm_meta(int(storm_id))
     rows[idx]["storm_window"] = {"start": start_iso, "end": end_iso}
     _save_storms_metadata(rows)
-    return {"rows": len(new_df), "storm_window": {"start": start_iso, "end": end_iso}}
-
-
-@app.get("/api/combined/csv")
-async def api_combined_csv():
-    """
-    Download the combined CSV with all saved storm tracks.
-    """
-    if not COMBINED_TRACKS_PATH.exists():
-        csv_content = "storm_id,time_utc,lon,lat,pressure_hpa\n"
-        return StreamingResponse(
-            io.BytesIO(csv_content.encode("utf-8")),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=storm_tracks_labeled_web.csv"},
-        )
-    return FileResponse(
-        COMBINED_TRACKS_PATH,
-        media_type="text/csv",
-        filename="storm_tracks_labeled_web.csv",
-    )
+    return {
+        "rows": len(track),
+        "track_path": _rel_path_str(track_path),
+        "storm_window": {"start": start_iso, "end": end_iso},
+    }
 
 
 # Serve static frontend

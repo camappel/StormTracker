@@ -59,11 +59,11 @@
                     <input type="datetime-local" id="era5-end-input" step="60">
                   </div>
                 </div>
-                <button type="button" id="btn-era5-apply" class="button secondary-button">Apply ERA5 window</button>
+                <div class="era5-action-row">
+                  <button type="button" id="btn-era5-apply" class="button secondary-button">Apply ERA5 window</button>
+                  <button type="button" id="btn-update-track" class="button secondary-button" disabled>Update Storm Track</button>
+                </div>
               </div>
-            </div>
-            <div id="water-level-chart-wrap" class="chart-wrap" hidden>
-              <canvas id="water-tide-chart"></canvas>
             </div>
           </div>
           <form id="era5-form" class="era5-form">
@@ -93,15 +93,6 @@
               <div><strong>Current frame:</strong> <span id="active-current-frame">—</span></div>
               <div><strong>Last frame:</strong> <span id="active-last-frame">—</span></div>
               <div><strong>Active frames:</strong> <span id="active-frame-count">0</span></div>
-            </div>
-            <div class="mode-controls">
-              <label><input type="radio" name="mode" value="add" checked> Add point</label>
-              <label><input type="radio" name="mode" value="delete"> Delete point</label>
-            </div>
-            <div class="actions">
-              <a id="btn-download" href="#" download="storm_track.csv" class="button" style="visibility: hidden;">Download CSV (this session)</a>
-              <button type="button" id="btn-save-combined" class="button secondary-button" disabled>Save storm to combined CSV</button>
-              <a id="btn-download-combined" href="/api/combined/csv" class="button" target="_blank">Download combined CSV</a>
             </div>
           </section>
         </div>
