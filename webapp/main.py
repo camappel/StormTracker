@@ -3,6 +3,7 @@ StormTracker ERA5 Web App — FastAPI backend.
 Upload ERA5 NetCDF, step through time, draw storm track by clicking, update persisted track data.
 """
 import io
+import hashlib
 import json
 import os
 import re
@@ -71,52 +72,67 @@ DEFAULT_CODEC_GTSM_DIRS = [
 ]
 
 DATA_ROOT_DIR = _env_path("STORMTRACKER_DATA_DIR", PROJECT_DIR / "data")
-SUPPORTED_DATASETS = ("eastern_scheldt", "thames")
-DEFAULT_DATASET = os.getenv("STORMTRACKER_DEFAULT_DATASET", "eastern_scheldt").strip() or "eastern_scheldt"
-ALLOWED_STORM_TYPES = ("Channel Rate", "North Sea Storm")
+SUPPORTED_BARRIERS = ("eastern_scheldt", "thames")
+DEFAULT_BARRIER = os.getenv("STORMTRACKER_DEFAULT_BARRIER", "eastern_scheldt").strip() or "eastern_scheldt"
+ALLOWED_STORM_TYPES = ("Channel Rat", "North Sea Storm")
 CODEC_GTSM_DIRS = _env_path_list("STORMTRACKER_CODEC_GTSM_DIRS", DEFAULT_CODEC_GTSM_DIRS)
+GTSM_SUBSET_STORM_FILE_RE = re.compile(r"^GTSM_subset_storm_(\d+)_(.+)\.nc$")
 
 
-def _normalize_dataset(dataset: str | None) -> str:
-    resolved = (dataset or DEFAULT_DATASET).strip().lower()
-    if resolved not in SUPPORTED_DATASETS:
+def _normalize_barrier(barrier: str | None) -> str:
+    resolved = (barrier or DEFAULT_BARRIER).strip().lower()
+    if resolved not in SUPPORTED_BARRIERS:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid dataset '{dataset}'. Supported datasets: {', '.join(SUPPORTED_DATASETS)}",
+            detail=f"Invalid barrier '{barrier}'. Supported barriers: {', '.join(SUPPORTED_BARRIERS)}",
         )
     return resolved
 
 
-def _dataset_dir(dataset: str | None = None) -> Path:
-    return DATA_ROOT_DIR / _normalize_dataset(dataset)
-
-
-def _storms_path(dataset: str | None = None) -> Path:
-    return _dataset_dir(dataset) / "storms.json"
+def _normalize_dataset(dataset: str | None) -> str:
+    """Backward-compatible alias; dataset now maps to barrier."""
+    return _normalize_barrier(dataset)
 
 
 def _master_storms_path() -> Path:
     return DATA_ROOT_DIR / "storms.json"
 
 
-def _water_level_series_path(dataset: str | None = None) -> Path:
-    return _dataset_dir(dataset) / "water_level_series.json"
+def _water_level_series_path(barrier: str | None = None) -> Path:
+    barrier_key = _normalize_barrier(barrier)
+    return DATA_ROOT_DIR / f"water_level_series_{barrier_key}.json"
 
 
-def _storm_root_dir(storm_id: int, dataset: str | None = None) -> Path:
-    return _dataset_dir(dataset) / f"storm_{int(storm_id)}"
+def _storm_root_dir(storm_id: int) -> Path:
+    return DATA_ROOT_DIR / f"storm_{int(storm_id)}"
 
 
-def _storm_era5_dir(storm_id: int, dataset: str | None = None) -> Path:
-    return _storm_root_dir(storm_id, dataset) / "era5"
+def _storm_era5_dir(storm_id: int) -> Path:
+    return _storm_root_dir(storm_id) / "era5"
 
 
-def _storm_gtsm_dir(storm_id: int, dataset: str | None = None) -> Path:
-    return _storm_root_dir(storm_id, dataset) / "gtsm"
+def _shared_era5_dir() -> Path:
+    return DATA_ROOT_DIR / "era5"
+
+
+def _shared_gtsm_dir() -> Path:
+    return DATA_ROOT_DIR / "gtsm"
+
+
+def _shared_storm_track_dir() -> Path:
+    return DATA_ROOT_DIR / "storm_track"
+
+
+def _legacy_storm_gtsm_dir(storm_id: int) -> Path:
+    return _storm_root_dir(storm_id) / "gtsm"
 
 
 def _era5_file_name(start_iso: str, end_iso: str) -> str:
     return f"ERA5_{_window_key(start_iso, end_iso)}.nc"
+
+
+def _shared_era5_path_for_window(start_iso: str, end_iso: str) -> Path:
+    return _shared_era5_dir() / _era5_file_name(start_iso, end_iso)
 
 
 def _gtsm_subset_file_name(start_iso: str, end_iso: str) -> str:
@@ -125,6 +141,14 @@ def _gtsm_subset_file_name(start_iso: str, end_iso: str) -> str:
 
 def _storm_track_file_name(start_iso: str, end_iso: str) -> str:
     return f"track_{_window_key(start_iso, end_iso)}.json"
+
+
+def _shared_gtsm_subset_path_for_window(start_iso: str, end_iso: str) -> Path:
+    return _shared_gtsm_dir() / _gtsm_subset_file_name(start_iso, end_iso)
+
+
+def _shared_storm_track_path_for_window(start_iso: str, end_iso: str) -> Path:
+    return _shared_storm_track_dir() / _storm_track_file_name(start_iso, end_iso)
 
 app = FastAPI(title="StormTracker ERA5 Web App")
 app.add_middleware(
@@ -179,8 +203,8 @@ def _normalize_storm_type(value: str | None) -> str | None:
     if s in ALLOWED_STORM_TYPES:
         return s
     lowered = s.lower()
-    if lowered == "channel rate":
-        return "Channel Rate"
+    if lowered == "channel rat":
+        return "Channel Rat"
     if lowered == "north sea storm":
         return "North Sea Storm"
     return None
@@ -240,39 +264,8 @@ def _storm_int_from_name(storm_name: str) -> int:
 
 
 def _load_storms_metadata(dataset: str | None = None) -> list[dict]:
-    payload = _json_load(_storms_path(dataset))
-    if not isinstance(payload, list):
-        raise HTTPException(status_code=500, detail="storms.json must be a JSON list")
-    cleaned = []
-    for row in payload:
-        if not isinstance(row, dict) or not row.get("storm"):
-            continue
-        era5_window = row.get("era5_window") or {}
-        storm_window = row.get("storm_window") or {}
-        closures = row.get("closures") if isinstance(row.get("closures"), list) else []
-        cleaned.append(
-            {
-                "storm": str(row["storm"]),
-                "storm_type": _normalize_storm_type(row.get("storm_type")),
-                "era5_window": {
-                    "start": _normalize_iso_utc(era5_window.get("start")),
-                    "end": _normalize_iso_utc(era5_window.get("end")),
-                },
-                "storm_window": {
-                    "start": _normalize_iso_utc(storm_window.get("start")),
-                    "end": _normalize_iso_utc(storm_window.get("end")),
-                },
-                "closures": [
-                    {
-                        "start": _normalize_iso_utc(c.get("start")),
-                        "end": _normalize_iso_utc(c.get("end")),
-                    }
-                    for c in closures
-                    if isinstance(c, dict)
-                ],
-            }
-        )
-    return cleaned
+    _ = dataset
+    return _load_master_storms_metadata()
 
 
 def _load_master_storms_metadata() -> list[dict]:
@@ -313,7 +306,12 @@ def _load_master_storms_metadata() -> list[dict]:
 
 
 def _save_storms_metadata(rows: list[dict], dataset: str | None = None) -> None:
-    # Persist storms.json in canonical minimal schema only.
+    _ = dataset
+    _save_master_storms_metadata(rows)
+
+
+def _save_master_storms_metadata(rows: list[dict]) -> None:
+    # Persist master storms.json with per-closure barrier metadata.
     normalized_rows = []
     for row in rows:
         if not isinstance(row, dict) or not row.get("storm"):
@@ -337,17 +335,19 @@ def _save_storms_metadata(rows: list[dict], dataset: str | None = None) -> None:
                     {
                         "start": _normalize_iso_utc(c.get("start")),
                         "end": _normalize_iso_utc(c.get("end")),
+                        "barrier": str(c.get("barrier") or "").strip().lower(),
                     }
                     for c in closures
                     if isinstance(c, dict)
                 ],
             }
         )
-    _json_save(_storms_path(dataset), normalized_rows)
+    _json_save(_master_storms_path(), normalized_rows)
 
 
 def _find_storm_meta(storm_id: int, dataset: str | None = None) -> tuple[int, dict]:
-    rows = _load_storms_metadata(dataset)
+    _ = dataset
+    rows = _load_master_storms_metadata()
     for idx, row in enumerate(rows):
         try:
             if _storm_int_from_name(row["storm"]) == int(storm_id):
@@ -357,9 +357,30 @@ def _find_storm_meta(storm_id: int, dataset: str | None = None) -> tuple[int, di
     raise HTTPException(status_code=404, detail=f"Storm {storm_id} not found in storms.json")
 
 
-def _storm_track_path(storm_id: int, start_iso: str, end_iso: str, dataset: str | None = None) -> Path:
+def _legacy_storm_track_path(storm_id: int, start_iso: str, end_iso: str, dataset: str | None = None) -> Path:
     sid = int(storm_id)
-    return _storm_root_dir(sid, dataset) / "storm_track" / _storm_track_file_name(start_iso, end_iso)
+    _ = dataset
+    return _storm_root_dir(sid) / "storm_track" / _storm_track_file_name(start_iso, end_iso)
+
+
+def _resolve_storm_track_path_for_window(
+    storm_id: int,
+    start_iso: str,
+    end_iso: str,
+    dataset: str | None = None,
+) -> Path:
+    shared = _shared_storm_track_path_for_window(start_iso, end_iso)
+    if shared.exists():
+        return shared
+    legacy = _legacy_storm_track_path(storm_id, start_iso, end_iso, dataset)
+    if legacy.exists():
+        return legacy
+    return shared
+
+
+def _storm_track_path(storm_id: int, start_iso: str, end_iso: str, dataset: str | None = None) -> Path:
+    _ = (storm_id, dataset)
+    return _shared_storm_track_path_for_window(start_iso, end_iso)
 
 
 def _export_path_for_session(
@@ -372,11 +393,10 @@ def _export_path_for_session(
 ) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     storm_id = session.get("storm_id")
-    dataset = session.get("dataset")
     if storm_id is not None:
-        base_dir = _storm_root_dir(int(storm_id), dataset) / "exports"
+        base_dir = _storm_root_dir(int(storm_id)) / "exports"
     else:
-        base_dir = _dataset_dir(dataset) / "exports" / f"session_{session_id}"
+        base_dir = DATA_ROOT_DIR / "exports" / f"session_{session_id}"
     start_idx = int(frame_indices[0])
     end_idx = int(frame_indices[-1])
     name = f"{product}_{start_idx:04d}_{end_idx:04d}_{fps}fps_{stamp}.{fmt}"
@@ -456,7 +476,7 @@ def _load_persisted_track(
 ) -> list[dict]:
     if not start_iso or not end_iso:
         return []
-    path = _storm_track_path(storm_id, start_iso, end_iso, dataset)
+    path = _resolve_storm_track_path_for_window(storm_id, start_iso, end_iso, dataset)
     if not path.exists():
         return []
     payload = _json_load(path)
@@ -472,11 +492,284 @@ def _pick_default_window(meta: dict) -> tuple[str | None, str | None]:
 
 def _era5_path_for_window(storm_id: int, start_iso: str, end_iso: str, dataset: str | None = None) -> Path:
     sid = int(storm_id)
-    return _storm_era5_dir(sid, dataset) / _era5_file_name(start_iso, end_iso)
+    _ = dataset
+    return _storm_era5_dir(sid) / _era5_file_name(start_iso, end_iso)
 
 
-def _load_water_level_series_all(dataset: str | None = None) -> list[dict]:
-    payload = _json_load(_water_level_series_path(dataset))
+def _parse_era5_filename_to_window(file_name: str) -> tuple[str, str] | None:
+    match = re.match(r"^ERA5_(\d{8}T\d{6}Z)_(\d{8}T\d{6}Z)\.nc$", file_name or "")
+    if not match:
+        return None
+    start_token, end_token = match.group(1), match.group(2)
+
+    def _token_to_iso(token: str) -> str:
+        return (
+            f"{token[0:4]}-{token[4:6]}-{token[6:8]}"
+            f"T{token[9:11]}:{token[11:13]}:{token[13:15]}Z"
+        )
+
+    try:
+        return _canonical_window(_token_to_iso(start_token), _token_to_iso(end_token))
+    except HTTPException:
+        return None
+
+
+def _resolve_era5_path_for_window(
+    storm_id: int,
+    start_iso: str,
+    end_iso: str,
+    dataset: str | None = None,
+) -> Path:
+    # Shared-only storage policy.
+    return _shared_era5_path_for_window(start_iso, end_iso)
+
+
+def _legacy_gtsm_subset_path_for_window(
+    storm_id: int,
+    start_iso: str,
+    end_iso: str,
+    dataset: str | None = None,
+) -> Path:
+    _ = dataset
+    return _legacy_storm_gtsm_dir(storm_id) / _gtsm_subset_file_name(start_iso, end_iso)
+
+
+def _resolve_gtsm_subset_path_for_window(
+    storm_id: int,
+    start_iso: str,
+    end_iso: str,
+    dataset: str | None = None,
+) -> Path:
+    shared = _shared_gtsm_subset_path_for_window(start_iso, end_iso)
+    if shared.exists():
+        return shared
+    legacy = _legacy_gtsm_subset_path_for_window(storm_id, start_iso, end_iso, dataset)
+    if legacy.exists():
+        return legacy
+    return shared
+
+
+def _gtsm_frame_cache_name(ts: pd.Timestamp) -> str:
+    token = _window_token(_normalize_iso_utc(ts.isoformat()) or ts.strftime("%Y%m%dT%H%M%SZ"))
+    # Cache version in filename so rendered overlays can evolve safely.
+    return f"gtsm_v2_{token}.png"
+
+
+def _legacy_gtsm_frame_cache_path(
+    storm_id: int,
+    start_iso: str,
+    end_iso: str,
+    ts: pd.Timestamp,
+    dataset: str | None = None,
+) -> Path:
+    win_key = _window_key(start_iso, end_iso)
+    out_name = _gtsm_frame_cache_name(ts)
+    _ = dataset
+    return _legacy_storm_gtsm_dir(storm_id) / win_key / out_name
+
+
+def _shared_gtsm_frame_cache_path(start_iso: str, end_iso: str, ts: pd.Timestamp) -> Path:
+    win_key = _window_key(start_iso, end_iso)
+    out_name = _gtsm_frame_cache_name(ts)
+    return _shared_gtsm_dir() / win_key / out_name
+
+
+def _resolve_gtsm_frame_cache_path(
+    storm_id: int,
+    start_iso: str,
+    end_iso: str,
+    ts: pd.Timestamp,
+    dataset: str | None = None,
+) -> Path:
+    shared = _shared_gtsm_frame_cache_path(start_iso, end_iso, ts)
+    if shared.exists():
+        return shared
+    legacy = _legacy_gtsm_frame_cache_path(storm_id, start_iso, end_iso, ts, dataset)
+    if legacy.exists():
+        return legacy
+    return shared
+
+
+def _window_overlaps(
+    a_start_utc: str | None,
+    a_end_utc: str | None,
+    b_start_utc: str | None,
+    b_end_utc: str | None,
+) -> bool:
+    if not a_start_utc or not a_end_utc or not b_start_utc or not b_end_utc:
+        return False
+    a_start = pd.Timestamp(a_start_utc)
+    a_end = pd.Timestamp(a_end_utc)
+    b_start = pd.Timestamp(b_start_utc)
+    b_end = pd.Timestamp(b_end_utc)
+    return max(a_start, b_start) <= min(a_end, b_end)
+
+
+def _storm_closure_window(meta: dict) -> tuple[str | None, str | None]:
+    closures = [c for c in (meta.get("closures") or []) if isinstance(c, dict)]
+    starts = [pd.Timestamp(c["start"]) for c in closures if c.get("start")]
+    ends = [pd.Timestamp(c["end"]) for c in closures if c.get("end")]
+    if not starts or not ends:
+        return None, None
+    return _canonical_window(min(starts).to_pydatetime(), max(ends).to_pydatetime())
+
+
+def _list_cached_era5_windows_for_storm(
+    storm_id: int,
+    meta: dict,
+    dataset: str | None = None,
+) -> list[dict]:
+    windows: set[tuple[str, str]] = set()
+    base_dir = _shared_era5_dir()
+    if base_dir.exists():
+        for path in base_dir.glob("ERA5_*.nc"):
+            parsed = _parse_era5_filename_to_window(path.name)
+            if parsed:
+                windows.add(parsed)
+
+    if not windows:
+        return []
+
+    default_start, default_end = _pick_default_window(meta)
+    closure_start, closure_end = _storm_closure_window(meta)
+    filtered = []
+    for start_utc, end_utc in windows:
+        if not default_start and not default_end and not closure_start and not closure_end:
+            filtered.append((start_utc, end_utc))
+            continue
+        if _window_overlaps(start_utc, end_utc, default_start, default_end):
+            filtered.append((start_utc, end_utc))
+            continue
+        if _window_overlaps(start_utc, end_utc, closure_start, closure_end):
+            filtered.append((start_utc, end_utc))
+            continue
+
+    filtered.sort(key=lambda r: (r[0], r[1]))
+    return [{"start_utc": start_utc, "end_utc": end_utc} for start_utc, end_utc in filtered]
+
+
+def _migrate_legacy_era5_to_shared() -> None:
+    """
+    One-time migration for legacy per-storm ERA5 files:
+    - Move data/*/storm_*/era5/ERA5_*.nc into data/era5/
+    - Keep only one shared copy per ERA5_<window_key>.nc
+    - Remove empty legacy era5 directories (and empty storm directories)
+    """
+    shared_dir = _shared_era5_dir()
+    shared_dir.mkdir(parents=True, exist_ok=True)
+
+    legacy_paths = sorted(DATA_ROOT_DIR.glob("*/storm_*/era5/ERA5_*.nc"))
+    for src_path in legacy_paths:
+        target_path = shared_dir / src_path.name
+        if target_path.exists():
+            src_size = src_path.stat().st_size
+            target_size = target_path.stat().st_size
+            if src_size != target_size:
+                raise RuntimeError(
+                    "ERA5 migration conflict for "
+                    f"{src_path.name}: shared file size {target_size} != legacy file size {src_size} "
+                    f"({src_path})"
+                )
+            src_path.unlink(missing_ok=True)
+            continue
+        src_path.replace(target_path)
+
+    # Cleanup empty legacy era5 directories and empty storm directories.
+    for era5_dir in sorted(DATA_ROOT_DIR.glob("*/storm_*/era5")):
+        try:
+            era5_dir.rmdir()
+        except OSError:
+            continue
+        storm_dir = era5_dir.parent
+        try:
+            storm_dir.rmdir()
+        except OSError:
+            continue
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _move_file_to_shared_or_raise(src_path: Path, target_path: Path, label: str) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists():
+        src_size = src_path.stat().st_size
+        target_size = target_path.stat().st_size
+        if src_size != target_size:
+            raise RuntimeError(
+                f"{label} migration conflict for {target_path.name}: "
+                f"shared file size {target_size} != legacy file size {src_size} ({src_path})"
+            )
+        if _sha256_file(src_path) != _sha256_file(target_path):
+            raise RuntimeError(
+                f"{label} migration conflict for {target_path.name}: "
+                f"shared and legacy content differ ({src_path})"
+            )
+        src_path.unlink(missing_ok=True)
+        return
+    src_path.replace(target_path)
+
+
+def _normalize_legacy_gtsm_filename(name: str) -> str:
+    mm = GTSM_SUBSET_STORM_FILE_RE.match(name or "")
+    if not mm:
+        return name
+    return f"GTSM_subset_{mm.group(2)}.nc"
+
+
+def _migrate_legacy_gtsm_to_shared() -> None:
+    """
+    One-time migration for legacy per-storm GTSM files:
+    - Move data/*/storm_*/gtsm/** into data/gtsm/**
+    - Keep one shared copy per target file, validating exact content on collisions
+    """
+    shared_dir = _shared_gtsm_dir()
+    shared_dir.mkdir(parents=True, exist_ok=True)
+
+    for gtsm_dir in sorted(DATA_ROOT_DIR.glob("*/storm_*/gtsm")):
+        for src_path in sorted(p for p in gtsm_dir.rglob("*") if p.is_file()):
+            rel = src_path.relative_to(gtsm_dir)
+            rel_parts = list(rel.parts)
+            if rel_parts:
+                rel_parts[-1] = _normalize_legacy_gtsm_filename(rel_parts[-1])
+            target_path = shared_dir / Path(*rel_parts)
+            _move_file_to_shared_or_raise(src_path, target_path, label="GTSM")
+
+    for gtsm_dir in sorted(DATA_ROOT_DIR.glob("*/storm_*/gtsm")):
+        try:
+            gtsm_dir.rmdir()
+        except OSError:
+            continue
+
+
+def _migrate_legacy_storm_track_to_shared() -> None:
+    """
+    One-time migration for legacy per-storm track files:
+    - Move data/*/storm_*/storm_track/track_*.json into data/storm_track/
+    - Keep one shared copy per track_<window>.json, validating exact content on collisions
+    """
+    shared_dir = _shared_storm_track_dir()
+    shared_dir.mkdir(parents=True, exist_ok=True)
+
+    for track_dir in sorted(DATA_ROOT_DIR.glob("*/storm_*/storm_track")):
+        for src_path in sorted(track_dir.glob("track_*.json")):
+            target_path = shared_dir / src_path.name
+            _move_file_to_shared_or_raise(src_path, target_path, label="storm_track")
+
+    for track_dir in sorted(DATA_ROOT_DIR.glob("*/storm_*/storm_track")):
+        try:
+            track_dir.rmdir()
+        except OSError:
+            continue
+
+
+def _load_water_level_series_all(barrier: str | None = None) -> list[dict]:
+    payload = _json_load(_water_level_series_path(barrier))
     if isinstance(payload, list):
         return payload
     raise HTTPException(
@@ -535,17 +828,21 @@ def _slice_flat_series_for_storm(series_rows: list[dict], meta: dict) -> list[di
     return [p for p in normalized if win_start <= p["time_utc"] <= win_end]
 
 
-def _series_for_storm(storm_id: int, meta: dict, dataset: str | None = None) -> list[dict]:
-    payload = _load_water_level_series_all(dataset)
+def _series_for_storm(storm_id: int, meta: dict, barrier: str | None = None) -> list[dict]:
+    _ = storm_id
+    payload = _load_water_level_series_all(barrier)
     sliced = _slice_flat_series_for_storm(payload, meta)
-    if sliced:
-        return sliced
-    raise HTTPException(status_code=404, detail=f"No water-level series found for storm {storm_id}")
+    return sliced
 
 
-def _get_storm_catalog(dataset: str | None = None) -> list[dict]:
+def _get_storm_catalog(barrier: str | None = None) -> list[dict]:
+    barrier_key = _normalize_barrier(barrier) if barrier else None
     rows = []
-    for storm in _load_storms_metadata(dataset):
+    for storm in _load_master_storms_metadata():
+        if barrier_key:
+            closures = [c for c in (storm.get("closures") or []) if isinstance(c, dict)]
+            if not any(str(c.get("barrier") or "").strip().lower() == barrier_key for c in closures):
+                continue
         sid = _storm_int_from_name(storm["storm"])
         default_start, default_end = _pick_default_window(storm)
         closures = storm.get("closures") or []
@@ -575,10 +872,10 @@ def _get_storm_catalog(dataset: str | None = None) -> list[dict]:
 
 def _get_closure_catalog(barrier: str | None = None) -> list[dict]:
     barrier_key = (barrier or "").strip().lower() or None
-    if barrier_key and barrier_key not in SUPPORTED_DATASETS:
+    if barrier_key and barrier_key not in SUPPORTED_BARRIERS:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid barrier '{barrier}'. Supported barriers: {', '.join(SUPPORTED_DATASETS)}",
+            detail=f"Invalid barrier '{barrier}'. Supported barriers: {', '.join(SUPPORTED_BARRIERS)}",
         )
     rows = []
     for storm in _load_master_storms_metadata():
@@ -594,7 +891,7 @@ def _get_closure_catalog(barrier: str | None = None) -> list[dict]:
             if not isinstance(c, dict):
                 continue
             closure_barrier = str(c.get("barrier") or "").strip().lower()
-            if closure_barrier not in SUPPORTED_DATASETS:
+            if closure_barrier not in SUPPORTED_BARRIERS:
                 continue
             if barrier_key and closure_barrier != barrier_key:
                 continue
@@ -619,13 +916,13 @@ def _get_closure_catalog(barrier: str | None = None) -> list[dict]:
 
 
 def _resolve_closure_to_storm(barrier: str, start_utc: str, end_utc: str) -> tuple[int, dict]:
-    barrier_key = _normalize_dataset(barrier)
+    barrier_key = _normalize_barrier(barrier)
     c_start = _normalize_iso_utc(start_utc)
     c_end = _normalize_iso_utc(end_utc)
     if not c_start or not c_end:
         raise HTTPException(status_code=400, detail="Invalid closure start/end timestamp")
 
-    for row in _load_storms_metadata(barrier_key):
+    for row in _load_master_storms_metadata():
         try:
             sid = _storm_int_from_name(str(row.get("storm") or ""))
         except HTTPException:
@@ -633,7 +930,12 @@ def _resolve_closure_to_storm(barrier: str, start_utc: str, end_utc: str) -> tup
         for c in row.get("closures") or []:
             if not isinstance(c, dict):
                 continue
-            if _normalize_iso_utc(c.get("start")) == c_start and _normalize_iso_utc(c.get("end")) == c_end:
+            closure_barrier = str(c.get("barrier") or "").strip().lower()
+            if (
+                closure_barrier == barrier_key
+                and _normalize_iso_utc(c.get("start")) == c_start
+                and _normalize_iso_utc(c.get("end")) == c_end
+            ):
                 return sid, row
     raise HTTPException(
         status_code=404,
@@ -641,33 +943,81 @@ def _resolve_closure_to_storm(barrier: str, start_utc: str, end_utc: str) -> tup
     )
 
 
+def _find_master_storm_by_closure(
+    barrier: str, closure_start_utc: str, closure_end_utc: str
+) -> tuple[int, dict]:
+    """Find master storm that contains the given closure. Returns (index, row). Raises 404 if not found."""
+    barrier_key = _normalize_barrier(barrier)
+    c_start = _normalize_iso_utc(closure_start_utc)
+    c_end = _normalize_iso_utc(closure_end_utc)
+    if not c_start or not c_end:
+        raise HTTPException(status_code=400, detail="Invalid closure start/end timestamp")
+    rows = _load_master_storms_metadata()
+    for idx, row in enumerate(rows):
+        for closure in row.get("closures") or []:
+            if not isinstance(closure, dict):
+                continue
+            if (
+                str(closure.get("barrier") or "").strip().lower() == barrier_key
+                and _normalize_iso_utc(closure.get("start")) == c_start
+                and _normalize_iso_utc(closure.get("end")) == c_end
+            ):
+                return idx, row
+    raise HTTPException(
+        status_code=404,
+        detail=f"No master storm found for closure {c_start}..{c_end} in barrier '{barrier_key}'",
+    )
+
+
+def _get_storm_type_from_master(
+    barrier: str, closure_start_utc: str, closure_end_utc: str
+) -> str | None:
+    """Return storm_type from master for the given closure, or None if not found."""
+    try:
+        _, row = _find_master_storm_by_closure(barrier, closure_start_utc, closure_end_utc)
+        return row.get("storm_type")
+    except HTTPException:
+        return None
+
+
 class StormTypeUpdateBody(BaseModel):
     storm_type: str | None = None
     dataset: str | None = None
+    barrier: str | None = None
+    closure_start_utc: str | None = None
+    closure_end_utc: str | None = None
 
 
 @app.get("/api/storms")
-async def api_storms(dataset: str | None = None):
+async def api_storms(barrier: str | None = None, dataset: str | None = None):
     """
     Return storm catalog with suggested ERA5 download windows and
     whether a pre-generated water level plot exists.
     """
-    dataset_key = _normalize_dataset(dataset)
-    return {"dataset": dataset_key, "storms": _get_storm_catalog(dataset_key)}
+    barrier_key = _normalize_barrier(barrier or dataset) if (barrier or dataset) else None
+    return {"barrier": barrier_key or "all", "storms": _get_storm_catalog(barrier_key)}
 
 
 @app.post("/api/storms/{storm_id}/storm-type")
 async def api_update_storm_type(storm_id: int, body: StormTypeUpdateBody):
-    dataset_key = _normalize_dataset(body.dataset)
-    rows = _load_storms_metadata(dataset_key)
-    idx, row = _find_storm_meta(storm_id, dataset_key)
+    barrier = _normalize_barrier(body.barrier or body.dataset) if (body.barrier or body.dataset) else None
+    closure_start_utc = _normalize_iso_utc(body.closure_start_utc)
+    closure_end_utc = _normalize_iso_utc(body.closure_end_utc)
+    if not barrier or not closure_start_utc or not closure_end_utc:
+        raise HTTPException(
+            status_code=400,
+            detail="barrier, closure_start_utc, and closure_end_utc are required to update storm type",
+        )
     storm_type = _validate_storm_type_input(body.storm_type)
-    rows[idx]["storm_type"] = storm_type
-    _save_storms_metadata(rows, dataset_key)
+    master_rows = _load_master_storms_metadata()
+    idx, m_row = _find_master_storm_by_closure(barrier, closure_start_utc, closure_end_utc)
+    master_rows[idx]["storm_type"] = storm_type
+    _save_master_storms_metadata(master_rows)
+    master_storm_id = _storm_int_from_name(m_row["storm"])
     return {
-        "dataset": dataset_key,
-        "storm_id": int(storm_id),
-        "storm": row.get("storm"),
+        "barrier": barrier,
+        "storm_id": master_storm_id,
+        "storm": m_row.get("storm"),
         "storm_type": storm_type,
     }
 
@@ -686,30 +1036,48 @@ async def api_closure_resolve(
 ):
     storm_id, meta = _resolve_closure_to_storm(barrier=barrier, start_utc=start_utc, end_utc=end_utc)
     default_start, default_end = _pick_default_window(meta)
+    storm_type = _get_storm_type_from_master(barrier, start_utc, end_utc)
     return {
-        "dataset": _normalize_dataset(barrier),
+        "barrier": _normalize_barrier(barrier),
         "storm_id": int(storm_id),
         "default_start_utc": default_start,
         "default_end_utc": default_end,
         "storm": meta.get("storm"),
-        "storm_type": meta.get("storm_type"),
+        "storm_type": storm_type,
     }
 
 
 @app.get("/api/storms/{storm_id}/water_level_series")
 async def api_storm_water_level_series(
     storm_id: int,
+    barrier: str | None = None,
     dataset: str | None = None,
 ):
-    dataset_key = _normalize_dataset(dataset)
-    _, meta = _find_storm_meta(storm_id, dataset_key)
-    normalized = _series_for_storm(storm_id, meta, dataset_key)
+    _, meta = _find_storm_meta(storm_id, None)
+    closures = [c for c in (meta.get("closures") or []) if isinstance(c, dict) and c.get("start") and c.get("end")]
+    selected_barrier = _normalize_barrier(barrier or dataset) if (barrier or dataset) else None
+    if not selected_barrier:
+        selected_barrier = str((closures[0] if closures else {}).get("barrier") or DEFAULT_BARRIER)
+        selected_barrier = _normalize_barrier(selected_barrier)
+    normalized = _series_for_storm(storm_id, meta, selected_barrier)
     default_start, default_end = _pick_default_window(meta)
     full_start = normalized[0]["time_utc"] if normalized else default_start
     full_end = normalized[-1]["time_utc"] if normalized else default_end
+    available_era5_windows = _list_cached_era5_windows_for_storm(storm_id, meta, selected_barrier)
     default_window_cached = False
     if default_start and default_end:
-        default_window_cached = _era5_path_for_window(storm_id, default_start, default_end, dataset_key).exists()
+        default_window_cached = _resolve_era5_path_for_window(
+            storm_id,
+            default_start,
+            default_end,
+            selected_barrier,
+        ).exists()
+    first_closure = closures[0] if closures else {}
+    storm_type = None
+    if first_closure.get("start") and first_closure.get("end"):
+        storm_type = _get_storm_type_from_master(
+            str(first_closure.get("barrier") or selected_barrier), first_closure["start"], first_closure["end"]
+        )
     return {
         "series": normalized,
         "full_series_start_utc": full_start,
@@ -717,14 +1085,19 @@ async def api_storm_water_level_series(
         "default_start_utc": default_start or full_start,
         "default_end_utc": default_end or full_end,
         "default_window_cached": default_window_cached,
+        "available_era5_windows": available_era5_windows,
         "storm_windows": [
-            {"start_utc": c.get("start"), "end_utc": c.get("end")}
-            for c in (meta.get("closures") or [])
+            {
+                "start_utc": c.get("start"),
+                "end_utc": c.get("end"),
+                "barrier": str(c.get("barrier") or "").strip().lower() or selected_barrier,
+            }
+            for c in closures
             if c.get("start") and c.get("end")
         ],
         "storm": meta["storm"],
-        "storm_type": meta.get("storm_type"),
-        "dataset": dataset_key,
+        "storm_type": storm_type,
+        "barrier": selected_barrier,
     }
 
 
@@ -826,8 +1199,8 @@ def add_map_base(ax, xlim, ylim):
         warnings.filterwarnings("ignore", message="facecolor will have no effect", module="cartopy")
         ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="white")
         ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="lightgray", alpha=0.3)
-    ax.add_feature(cfeature.COASTLINE.with_scale("50m"), linewidth=0.8, color="white")
-    ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.5, color="white")
+    ax.add_feature(cfeature.COASTLINE.with_scale("50m"), linewidth=1.4, color="white")
+    ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=1.2, color="white")
     ax.set_xlim(xlim)
     ax.set_ylim(ylim)
     # Fill the full axes area; prevents top/bottom bands in the rendered PNG.
@@ -915,8 +1288,8 @@ def render_frame(session: dict, time_index: int, track: list, *, show_track_poin
         ax.plot(
             track_lons,
             track_lats,
-            color="darkred",
-            linewidth=2,
+            color="white",
+            linewidth=4,
             transform=ccrs.PlateCarree(),
             zorder=10,
         )
@@ -924,7 +1297,7 @@ def render_frame(session: dict, time_index: int, track: list, *, show_track_poin
             ax.scatter(
                 track_lons,
                 track_lats,
-                c="darkred",
+                c="white",
                 s=30,
                 zorder=11,
                 transform=ccrs.PlateCarree(),
@@ -984,13 +1357,13 @@ def get_session(session_id: str):
 def _create_session_from_era5(
     path: Path,
     storm_id: int | None = None,
-    dataset: str | None = None,
+    barrier: str | None = None,
     window_start_utc: str | None = None,
     window_end_utc: str | None = None,
     track_window_start_utc: str | None = None,
     track_window_end_utc: str | None = None,
 ) -> dict:
-    dataset_key = _normalize_dataset(dataset)
+    barrier_key = _normalize_barrier(barrier) if barrier else DEFAULT_BARRIER
     data = parse_era5(path)
     track_start = track_window_start_utc or window_start_utc
     track_end = track_window_end_utc or window_end_utc
@@ -1000,7 +1373,7 @@ def _create_session_from_era5(
             track_start,
             track_end,
             data["frame_list"],
-            dataset=dataset_key,
+            dataset=barrier_key,
         )
         if storm_id is not None
         else []
@@ -1009,7 +1382,7 @@ def _create_session_from_era5(
     sessions[session_id] = {
         "path": path,
         "storm_id": int(storm_id) if storm_id is not None else None,
-        "dataset": dataset_key,
+        "barrier": barrier_key,
         "window_start_utc": window_start_utc,
         "window_end_utc": window_end_utc,
         **data,
@@ -1039,6 +1412,7 @@ class StartStormSessionBody(BaseModel):
     storm_id: int
     start_utc: str
     end_utc: str
+    barrier: str | None = None
     dataset: str | None = None
 
 
@@ -1076,16 +1450,65 @@ def _build_era5_month_segments(start_dt: datetime, end_dt: datetime) -> list[dic
     return segments
 
 
+def _era5_time_name(ds: xr.Dataset) -> str:
+    if "valid_time" in ds.coords or "valid_time" in ds.variables:
+        return "valid_time"
+    if "time" in ds.coords or "time" in ds.variables:
+        return "time"
+    raise HTTPException(status_code=500, detail="ERA5 dataset has no time coordinate")
+
+
+def _expected_era5_hourly_times(start_dt: datetime, end_dt: datetime) -> list[datetime]:
+    start_hour = pd.Timestamp(start_dt).ceil("h")
+    end_hour = pd.Timestamp(end_dt).floor("h")
+    if end_hour < start_hour:
+        return []
+    return [ts.to_pydatetime().replace(tzinfo=None) for ts in pd.date_range(start_hour, end_hour, freq="h")]
+
+
+def _build_era5_sparse_segments(missing_times: list[datetime]) -> list[dict]:
+    grouped: dict[tuple[int, int, int], set[int]] = {}
+    for t in missing_times:
+        key = (t.year, t.month, t.day)
+        grouped.setdefault(key, set()).add(int(t.hour))
+    segments = []
+    for (year, month, day), hours in sorted(grouped.items()):
+        segments.append(
+            {
+                "year": year,
+                "month": month,
+                "day": day,
+                "hours": sorted(hours),
+            }
+        )
+    return segments
+
+
+def _shared_cached_era5_paths_for_window(start_iso: str, end_iso: str) -> list[Path]:
+    shared_dir = _shared_era5_dir()
+    if not shared_dir.exists():
+        return []
+    paths = []
+    for path in shared_dir.glob("ERA5_*.nc"):
+        parsed = _parse_era5_filename_to_window(path.name)
+        if not parsed:
+            continue
+        p_start, p_end = parsed
+        if _window_overlaps(p_start, p_end, start_iso, end_iso):
+            paths.append(path)
+    return sorted(paths)
+
+
 @app.post("/api/storm/start-session")
 async def api_start_storm_session(body: StartStormSessionBody):
     """
     Download ERA5 file for the given storm + time window and create a
     StormTracker session bound to that storm_id.
 
-    ERA5 files are stored under data/storm_<id>/era5 so they can be reused across sessions.
+    ERA5 files are stored in a shared cache under data/era5 and reused across storms/sessions.
     """
     storm_id = int(body.storm_id)
-    dataset_key = _normalize_dataset(body.dataset)
+    barrier_key = _normalize_barrier(body.barrier or body.dataset)
     t_start = _parse_iso_utc(body.start_utc)
     t_end = _parse_iso_utc(body.end_utc)
     if t_end <= t_start:
@@ -1093,28 +1516,50 @@ async def api_start_storm_session(body: StartStormSessionBody):
     start_iso, end_iso = _canonical_window(t_start, t_end)
     win_key = _window_key(start_iso, end_iso)
 
-    meta_rows = _load_storms_metadata(dataset_key)
-    meta_idx, meta_row = _find_storm_meta(storm_id, dataset_key)
-    storm_era5_dir = _storm_era5_dir(storm_id, dataset_key)
-    storm_era5_dir.mkdir(parents=True, exist_ok=True)
-    target_era5_path = _era5_path_for_window(storm_id, start_iso, end_iso, dataset_key)
-    era5_path = target_era5_path if target_era5_path.exists() else None
+    meta_rows = _load_storms_metadata(None)
+    meta_idx, meta_row = _find_storm_meta(storm_id, None)
+    era5_path = _resolve_era5_path_for_window(storm_id, start_iso, end_iso, barrier_key)
 
-    if era5_path is None:
-        era5_path = target_era5_path
-        if not era5_path.exists():
+    if not era5_path.exists():
+        try:
+            import cdsapi  # type: ignore
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="cdsapi is not installed on the server; cannot download ERA5 automatically.",
+            )
+        client = cdsapi.Client()
+        valid_time_start = np.datetime64(t_start)
+        valid_time_end = np.datetime64(t_end)
+        expected_times = _expected_era5_hourly_times(t_start, t_end)
+        if not expected_times:
+            raise HTTPException(status_code=400, detail="Requested ERA5 window contains no full hourly frames.")
+
+        cached_pieces: list[xr.Dataset] = []
+        existing_times: set[pd.Timestamp] = set()
+        for cached_path in _shared_cached_era5_paths_for_window(start_iso, end_iso):
+            if cached_path == era5_path:
+                continue
+            ds_cached = xr.open_dataset(cached_path)
             try:
-                import cdsapi  # type: ignore
-            except ImportError:
-                raise HTTPException(
-                    status_code=500,
-                    detail="cdsapi is not installed on the server; cannot download ERA5 automatically.",
-                )
-            client = cdsapi.Client()
-            segments = _build_era5_month_segments(t_start, t_end)
-            if not segments:
-                raise HTTPException(status_code=400, detail="Invalid time range")
-            part_paths = []
+                time_name = _era5_time_name(ds_cached)
+                sliced = ds_cached.sel({time_name: slice(valid_time_start, valid_time_end)})
+                if int(sliced.sizes.get(time_name, 0)) == 0:
+                    continue
+                loaded = sliced.load()
+                for t in pd.to_datetime(loaded[time_name].values):
+                    existing_times.add(pd.Timestamp(t).tz_localize(None))
+                cached_pieces.append(loaded)
+            finally:
+                ds_cached.close()
+
+        missing_times = [t for t in expected_times if pd.Timestamp(t) not in existing_times]
+        segments = _build_era5_sparse_segments(missing_times)
+
+        downloaded_pieces: list[xr.Dataset] = []
+        with tempfile.TemporaryDirectory(prefix="stormtracker_era5_parts_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            part_paths: list[Path] = []
             for i, seg in enumerate(segments):
                 request = {
                     "product_type": "reanalysis",
@@ -1125,33 +1570,58 @@ async def api_start_storm_session(body: StartStormSessionBody):
                     ],
                     "year": [f"{seg['year']:04d}"],
                     "month": [f"{seg['month']:02d}"],
-                    "day": [f"{d:02d}" for d in seg["days"]],
+                    "day": [f"{seg['day']:02d}"],
                     "time": [f"{h:02d}:00" for h in seg["hours"]],
                     "area": [YB_MET[1], XB_MET[0], YB_MET[0], XB_MET[1]],
                     "format": "netcdf",
                 }
-                part_path = storm_era5_dir / f"ERA5_part_storm_{storm_id}_{win_key}_{i:02d}.nc"
+                part_path = tmp_path / f"ERA5_part_storm_{storm_id}_{win_key}_{i:02d}.nc"
                 client.retrieve("reanalysis-era5-single-levels", request).download(str(part_path))
                 part_paths.append(part_path)
-            valid_time_start = np.datetime64(t_start)
-            valid_time_end = np.datetime64(t_end)
-            ds_list = [xr.open_dataset(p) for p in part_paths]
-            try:
-                combined = xr.concat(sorted(ds_list, key=lambda d: d["valid_time"].values[0]), dim="valid_time")
-                combined = combined.sortby("valid_time")
-                combined = combined.sel(valid_time=slice(valid_time_start, valid_time_end))
-                if int(combined.sizes.get("valid_time", 0)) == 0:
-                    raise HTTPException(status_code=500, detail="Downloaded ERA5 data does not cover requested time range.")
-                combined.to_netcdf(era5_path)
-                combined.close()
-            finally:
-                for ds in ds_list:
-                    ds.close()
-                for p in part_paths:
-                    p.unlink(missing_ok=True)
+
+            for part_path in part_paths:
+                ds_part = xr.open_dataset(part_path)
+                try:
+                    time_name = _era5_time_name(ds_part)
+                    sliced = ds_part.sel({time_name: slice(valid_time_start, valid_time_end)})
+                    if int(sliced.sizes.get(time_name, 0)) == 0:
+                        continue
+                    downloaded_pieces.append(sliced.load())
+                finally:
+                    ds_part.close()
+
+        all_pieces = cached_pieces + downloaded_pieces
+        if not all_pieces:
+            raise HTTPException(status_code=500, detail="No ERA5 frames available for requested time range.")
+
+        time_name = _era5_time_name(all_pieces[0])
+        try:
+            combined = xr.concat(sorted(all_pieces, key=lambda d: d[time_name].values[0]), dim=time_name)
+            combined = combined.sortby(time_name)
+            tvals = pd.to_datetime(combined[time_name].values)
+            _, uniq_idx = np.unique(np.asarray(tvals), return_index=True)
+            uniq_idx = sorted(int(i) for i in uniq_idx)
+            combined = combined.isel({time_name: uniq_idx})
+            combined = combined.sel({time_name: slice(valid_time_start, valid_time_end)})
+            present_times = {pd.Timestamp(t).tz_localize(None) for t in pd.to_datetime(combined[time_name].values)}
+            missing_after_merge = [t for t in expected_times if pd.Timestamp(t) not in present_times]
+            if missing_after_merge:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"ERA5 cache+download does not cover requested window. "
+                        f"Missing {len(missing_after_merge)} hourly frame(s)."
+                    ),
+                )
+            era5_path.parent.mkdir(parents=True, exist_ok=True)
+            combined.to_netcdf(era5_path)
+            combined.close()
+        finally:
+            for ds_piece in all_pieces:
+                ds_piece.close()
 
     meta_rows[meta_idx]["era5_window"] = {"start": start_iso, "end": end_iso}
-    _save_storms_metadata(meta_rows, dataset_key)
+    _save_storms_metadata(meta_rows, None)
 
     track_window = meta_row.get("storm_window") if isinstance(meta_row.get("storm_window"), dict) else {}
     track_window_start = _normalize_iso_utc(track_window.get("start"))
@@ -1160,7 +1630,7 @@ async def api_start_storm_session(body: StartStormSessionBody):
     session_payload = _create_session_from_era5(
         era5_path,
         storm_id=storm_id,
-        dataset=dataset_key,
+        barrier=barrier_key,
         window_start_utc=start_iso,
         window_end_utc=end_iso,
         track_window_start_utc=track_window_start,
@@ -1240,11 +1710,10 @@ def _build_gtsm_subset_for_window(
     frame_times: list[pd.Timestamp],
     dataset: str | None = None,
 ) -> Path | None:
-    subset_dir = _storm_gtsm_dir(storm_id, dataset)
-    subset_dir.mkdir(parents=True, exist_ok=True)
-    subset_path = subset_dir / _gtsm_subset_file_name(start_iso, end_iso)
+    subset_path = _resolve_gtsm_subset_path_for_window(storm_id, start_iso, end_iso, dataset)
     if subset_path.exists():
         return subset_path
+    subset_path.parent.mkdir(parents=True, exist_ok=True)
 
     month_targets: dict[tuple[int, int], list[pd.Timestamp]] = {}
     for t in frame_times:
@@ -1404,7 +1873,7 @@ def _build_session_gtsm_subset(session: dict) -> Path | None:
         start_iso,
         end_iso,
         frame_times,
-        dataset=session.get("dataset"),
+        dataset=session.get("barrier"),
     )
     if subset:
         session["gtsm_subset_path"] = str(subset)
@@ -1427,11 +1896,13 @@ def _gtsm_frame_cache_path(session: dict, time_index: int) -> Path:
         end_iso = _normalize_iso_utc(pd.Timestamp(frame_list[-1][1]).isoformat())
     if not start_iso or not end_iso:
         raise HTTPException(status_code=500, detail="Unable to resolve session window for GTSM")
-    win_key = _window_key(start_iso, end_iso)
-    out_dir = _storm_gtsm_dir(int(storm_id), session.get("dataset")) / win_key
-    # Cache version in filename so rendered overlays can evolve safely.
-    out_name = f"gtsm_v2_{_window_token(_normalize_iso_utc(ts_pd.isoformat()) or ts_pd.strftime('%Y%m%dT%H%M%SZ'))}.png"
-    return out_dir / out_name
+    return _resolve_gtsm_frame_cache_path(
+        int(storm_id),
+        start_iso,
+        end_iso,
+        ts_pd,
+        dataset=session.get("barrier"),
+    )
 
 
 def _resolve_export_indices(session: dict, product: str, pad_frames: int = 3) -> list[int]:
@@ -1710,12 +2181,12 @@ def _labelled_window_indices(session: dict, pad_hours: int = 0) -> tuple[int, in
 @app.post("/api/track/update/{session_id}")
 async def api_track_update(session_id: str):
     """
-    Persist this session's track under data/storm_<id>/storm_track/<window>.json and refresh storm_window.
+    Persist this session's track under data/storm_track/track_<window>.json and refresh storm_window.
     """
     session = get_session(session_id)
     session["last_access"] = time.time()
     storm_id = session.get("storm_id")
-    dataset = session.get("dataset")
+    barrier = session.get("barrier")
     if storm_id is None:
         raise HTTPException(status_code=400, detail="Session is not associated with a storm_id")
     track = session.get("track") or []
@@ -1730,19 +2201,24 @@ async def api_track_update(session_id: str):
     start_iso = pd.Timestamp(start_ts).to_pydatetime().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
     end_iso = pd.Timestamp(end_ts).to_pydatetime().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
-    track_path = _storm_track_path(int(storm_id), start_iso, end_iso, dataset)
+    track_path = _storm_track_path(int(storm_id), start_iso, end_iso, barrier)
     track_path.parent.mkdir(parents=True, exist_ok=True)
     _json_save(track_path, _serialise_track_for_storage(track))
-    rows = _load_storms_metadata(dataset)
-    idx, _ = _find_storm_meta(int(storm_id), dataset)
+    rows = _load_storms_metadata(None)
+    idx, _ = _find_storm_meta(int(storm_id), None)
     rows[idx]["storm_window"] = {"start": start_iso, "end": end_iso}
-    _save_storms_metadata(rows, dataset)
+    _save_storms_metadata(rows, None)
     return {
         "rows": len(track),
         "track_path": _rel_path_str(track_path),
         "storm_window": {"start": start_iso, "end": end_iso},
     }
 
+
+# Ensure shared data directories exist and migrate legacy storm-local files.
+_migrate_legacy_era5_to_shared()
+_migrate_legacy_gtsm_to_shared()
+_migrate_legacy_storm_track_to_shared()
 
 # Serve static frontend
 static_dir = Path(__file__).parent / "static"

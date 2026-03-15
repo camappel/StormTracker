@@ -46,7 +46,8 @@ Startup order in the UI:
 
 ## Configuration (share-ready defaults)
 
-The app now runs from any clone location by default using `StormTracker/data`, and resolves files from `StormTracker/data/<dataset>/...`.
+The app now runs from any clone location by default using `StormTracker/data`.
+Dataset-specific files (metadata/water levels) are read from `StormTracker/data/<dataset>/...`, while shared ERA5/GTSM/track cache assets are stored directly under `StormTracker/data`.
 You can override storage locations with environment variables:
 
 - `STORMTRACKER_DATA_DIR` (defaults to `StormTracker/data`)
@@ -74,22 +75,25 @@ Optional: add `railway.toml` in the same directory (included) to pin the start c
 
 - `GET /api/storms?dataset=<dataset>` — Storm catalog loaded from `data/<dataset>/storms.json` (compatibility file generated from master metadata).
 - `GET /api/storms/<storm_id>/water_level_series?dataset=<dataset>` — Water-level series for selected storm, sliced server-side from flat `data/<dataset>/water_level_series.json` using closure bounds +/- 62 hours; returns `series`, `full_series_start_utc`, `full_series_end_utc`, `default_start_utc`, `default_end_utc`, and `storm_windows`.
-- `POST /api/storm/start-session` — JSON `{ storm_id, start_utc, end_utc, dataset }` → reuse local ERA5 if present, otherwise download to `data/<dataset>/storm_<storm_id>/era5/ERA5_<start>_<end>.nc`, then return `{ session_id, times, track, gtsm_available, bounds }` where `track` auto-loads from `data/<dataset>/storm_<storm_id>/storm_track/track_<start>_<end>.json` when available.
+- `POST /api/storm/start-session` — JSON `{ storm_id, start_utc, end_utc, dataset }` → reuse shared ERA5 cache if present, otherwise download to `data/era5/ERA5_<start>_<end>.nc`, then return `{ session_id, times, track, gtsm_available, bounds }` where `track` auto-loads from `data/storm_track/track_<start>_<end>.json` (window-keyed, barrier-agnostic).
 - `POST /api/upload` — multipart `.nc` file → `{ session_id, times, bounds }`
 - `GET /api/frame/<session_id>/<time_index>` — PNG image for that time step
-- `GET /api/gtsm/frame/<session_id>/<time_index>` — GTSM frame PNG for the same timestamp (cached under `data/<dataset>/storm_<storm_id>/gtsm/`)
+- `GET /api/gtsm/frame/<session_id>/<time_index>` — GTSM frame PNG for the same timestamp (subset/cache shared under `data/gtsm/`)
 - `POST /api/track/add` — JSON `{ session_id, time_index, lon, lat }` → append point (pressure interpolated)
 - `POST /api/track/delete` — JSON `{ session_id, time_index }` (or `time_index: -1` to remove last)
 - `GET /api/track/<session_id>` — current track as JSON
-- `POST /api/track/update/<session_id>` — persist track to `data/<dataset>/storm_<storm_id>/storm_track/track_<start>_<end>.json` (storm window key) and persist derived `storm_window` (min/max labelled frame times) into `data/<dataset>/storms.json`
+- `POST /api/track/update/<session_id>` — persist track to `data/storm_track/track_<start>_<end>.json` (ERA5 window key) and persist derived `storm_window` (min/max labelled frame times) into `data/<dataset>/storms.json`
 
-Sessions are in-memory for live editing, but storm tracks are persisted per storm under `data/<dataset>/storm_<storm_id>/storm_track` when updated.
+Sessions are in-memory for live editing, but storm tracks are persisted once per ERA5 window under `data/storm_track`.
 
 ## Migrate existing data layout
 
-If your data still uses legacy folders (`data/era5`, `data/gtsm`, `data/storm_tracks`), migrate once:
+On startup, the app automatically migrates legacy per-storm assets into shared folders when safe:
 
-```bash
-python StormTracker/scripts/migrate_storm_data_layout.py         # dry-run
-python StormTracker/scripts/migrate_storm_data_layout.py --apply # perform move
-```
+- `data/*/storm_*/era5/ERA5_*.nc` -> `data/era5/`
+- `data/*/storm_*/gtsm/**` -> `data/gtsm/**`
+- `data/*/storm_*/storm_track/track_*.json` -> `data/storm_track/`
+
+If a shared destination already exists with different content, startup raises a conflict error so data is not silently overwritten.
+
+The current shared layout does not require a separate migration command; startup migration handles supported legacy paths automatically.

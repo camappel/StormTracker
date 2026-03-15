@@ -41,7 +41,7 @@ DEFAULT_MASTER_OUT = DATA_DIR / "storms.json"
 DEFAULT_EASTERN_COMPAT_OUT = DATA_DIR / "eastern_scheldt" / "storms.json"
 
 ALLOWED_BARRIERS = {"eastern_scheldt", "thames"}
-ALLOWED_STORM_TYPES = {"Channel Rate", "North Sea Storm"}
+ALLOWED_STORM_TYPES = {"Channel Rat", "North Sea Storm"}
 
 
 def normalize_iso_utc(value: str | None) -> str | None:
@@ -69,8 +69,8 @@ def normalize_storm_type(value: str | None) -> str | None:
     if s in ALLOWED_STORM_TYPES:
         return s
     lowered = s.lower()
-    if lowered == "channel rate":
-        return "Channel Rate"
+    if lowered == "channel rat":
+        return "Channel Rat"
     if lowered == "north sea storm":
         return "North Sea Storm"
     return None

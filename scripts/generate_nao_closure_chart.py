@@ -60,13 +60,13 @@ def water_year_label(ts: pd.Timestamp) -> str:
 
 def load_nao_monthly_values(nao_path: Path, nao_fallback_path: Path) -> dict[int, dict[int, float]]:
     source = nao_path if nao_path.exists() else nao_fallback_path
-    if not source.exists():
+    if not source.is_file():
         raise FileNotFoundError(f"NAO file not found: {nao_path} (fallback: {nao_fallback_path})")
 
     monthly_by_year: dict[int, dict[int, float]] = {}
     for raw_line in source.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw_line.strip()
-        if not line:
+        if not line or line.startswith("#"):
             continue
         parts = line.split()
         if len(parts) < 13:
@@ -86,7 +86,10 @@ def load_nao_monthly_values(nao_path: Path, nao_fallback_path: Path) -> dict[int
 
 
 def build_nao_closure_rows(storms_path: Path, nao_monthly: dict[int, dict[int, float]], start_water_year: int) -> list[dict]:
-    storms = json.loads(storms_path.read_text(encoding="utf-8"))
+    try:
+        storms = json.loads(storms_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in storms file: {storms_path}") from exc
     if not isinstance(storms, list):
         raise ValueError(f"Expected JSON list in storms file: {storms_path}")
 
@@ -213,7 +216,7 @@ def render_chart(rows: list[dict], output_path: Path, dpi: int) -> None:
 
 def main() -> int:
     args = parse_args()
-    if not args.storms_path.exists():
+    if not args.storms_path.is_file():
         raise FileNotFoundError(f"Storms file not found: {args.storms_path}")
 
     nao_monthly = load_nao_monthly_values(args.nao_path, args.nao_fallback_path)

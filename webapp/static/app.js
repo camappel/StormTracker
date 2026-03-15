@@ -12,6 +12,7 @@
     closures: [],
     selectedStormId: null,
     selectedClosureKey: null,
+    selectedClosureStartUtc: null,
     waterSeries: [],
     window: { startIndex: 0, endIndex: 0 },
     stormWindows: [],
@@ -31,11 +32,11 @@
     gtsmAvailable: false,
     trackDirty: false,
     exportBusy: false,
-    selectedDataset: 'eastern_scheldt',
+    selectedBarrier: 'eastern_scheldt',
     selectedStormType: null
   };
 
-  const DATASET_META = {
+  const BARRIER_META = {
     eastern_scheldt: {
       gaugeLabel: 'Tide gauge: Eastern Scheldt (3.68°E, 51.64°N)'
     },
@@ -44,9 +45,14 @@
     }
   };
 
+  const BARRIER_WINDOW_COLORS = {
+    eastern_scheldt: { background: 'rgba(30, 136, 229, 0.15)', border: 'rgba(30, 136, 229, 0.55)' },
+    thames: { background: 'rgba(229, 57, 53, 0.15)', border: 'rgba(229, 57, 53, 0.55)' }
+  };
+  const DEFAULT_WINDOW_COLOR = { background: 'rgba(200, 100, 180, 0.15)', border: 'rgba(200, 100, 180, 0.5)' };
+
   function apiUrl(path) {
-    const qs = new URLSearchParams({ dataset: state.selectedDataset });
-    return `${API}${path}?${qs.toString()}`;
+    return `${API}${path}`;
   }
 
   const barrierFilterSelect = document.getElementById('barrier-filter-select');
@@ -90,9 +96,10 @@
 
   function updateGaugeLabel() {
     if (!gaugeLabel) return;
-    const meta = DATASET_META[state.selectedDataset] || DATASET_META.eastern_scheldt;
+    const meta = BARRIER_META[state.selectedBarrier] || BARRIER_META.eastern_scheldt;
     gaugeLabel.textContent = meta.gaugeLabel;
   }
+
   function showError(msg) {
     uploadError.textContent = msg;
     uploadError.hidden = false;
@@ -668,7 +675,7 @@
           storm_id: state.selectedStormId,
           start_utc: startIso,
           end_utc: endIso,
-          dataset: state.selectedDataset
+          barrier: state.selectedBarrier
         })
       });
       const data = await res.json();
@@ -686,6 +693,15 @@
       clearApiStatus();
       showError('Network error: ' + err.message);
     }
+  }
+
+  function pickAutoLoadEra5Window(defaultStartIso, defaultEndIso, availableWindows) {
+    const windows = Array.isArray(availableWindows) ? availableWindows : [];
+    if (!windows.length) return null;
+    const exact = windows.find((w) => (
+      w && w.start_utc === defaultStartIso && w.end_utc === defaultEndIso
+    ));
+    return exact || windows[0] || null;
   }
 
   function updateChartViewport(minUtc, maxUtc) {
@@ -767,14 +783,16 @@
     addLine(waterAnnotations, 'era5-start-line', era5Start, 'rgba(0, 0, 0, 0.95)', 'ERA5 Start', false);
     addLine(waterAnnotations, 'era5-end-line', era5End, 'rgba(0, 0, 0, 0.95)', 'ERA5 End', false);
     stormWindows.forEach(function (win, i) {
+      const barrierKey = ((win && win.barrier) || '').toLowerCase();
+      const windowColors = BARRIER_WINDOW_COLORS[barrierKey] || DEFAULT_WINDOW_COLOR;
       const box = {
         type: 'box',
         xMin: win.start_utc,
         xMax: win.end_utc,
         yMin: Number.NEGATIVE_INFINITY,
         yMax: Number.POSITIVE_INFINITY,
-        backgroundColor: 'rgba(200, 100, 180, 0.15)',
-        borderColor: 'rgba(200, 100, 180, 0.5)',
+        backgroundColor: windowColors.background,
+        borderColor: windowColors.border,
         borderWidth: 1
       };
       waterAnnotations['storm-window-' + i] = box;
@@ -865,7 +883,7 @@
     state.activeStartIdx = 0;
     state.activeEndIdx = Math.max(0, state.times.length - 1);
     state.timeIndex = state.activeStartIdx;
-    const currentAnchorIso = state.barrierEndUtc || state.defaultCurrentUtc;
+    const currentAnchorIso = state.selectedClosureStartUtc || state.defaultCurrentUtc;
     const currentMs = currentAnchorIso ? new Date(currentAnchorIso).getTime() : NaN;
     if (Number.isFinite(currentMs)) {
       let mappedCurrent = nearestIndexInRangeForTimeMs(
@@ -976,6 +994,7 @@
     destroyWindowSlider();
     state.sessionId = null;
     state.selectedStormId = null;
+    state.selectedClosureStartUtc = null;
     state.times = [];
     state.activeStartIdx = 0;
     state.activeEndIdx = 0;
@@ -1035,10 +1054,11 @@
   async function selectClosureRow(row) {
     if (!row) return;
     state.selectedClosureKey = closureRowKey(row);
+    state.selectedClosureStartUtc = row.closure_start_utc || null;
     renderClosuresTable();
     resetSessionState();
     resetStormUiState();
-    state.selectedDataset = row.barrier || 'eastern_scheldt';
+    state.selectedBarrier = row.barrier || 'eastern_scheldt';
     updateGaugeLabel();
     stormMeta.innerHTML = `
       <div><strong>Barrier:</strong> ${titleCaseBarrier(row.barrier)}</div>
@@ -1057,19 +1077,19 @@
       if (!res.ok) {
         throw new Error(payload.detail || 'Could not resolve closure to storm');
       }
-      state.selectedDataset = payload.dataset || row.barrier;
+      state.selectedBarrier = payload.barrier || row.barrier;
       state.selectedStormId = Number(payload.storm_id);
       setStormTypeEditorValue(payload.storm_type || row.storm_type || '');
       if (stormTypeEditor) stormTypeEditor.hidden = false;
       updateGaugeLabel();
       stormMeta.innerHTML = `
-        <div><strong>Barrier:</strong> ${titleCaseBarrier(state.selectedDataset)}</div>
+        <div><strong>Barrier:</strong> ${titleCaseBarrier(state.selectedBarrier)}</div>
         <div><strong>Storm:</strong> ${payload.storm || `storm_${state.selectedStormId}`}</div>
         <div><strong>Storm Type:</strong> ${displayStormType(state.selectedStormType)}</div>
         <div><strong>Closure (UTC):</strong> ${formatIsoForDisplay(row.closure_start_utc)} - ${formatIsoForDisplay(row.closure_end_utc)}</div>
       `;
       waterLevelPlaceholder.hidden = true;
-      loadWaterLevelSeries(state.selectedStormId);
+      loadWaterLevelSeries(state.selectedStormId, state.selectedBarrier);
     } catch (e) {
       showError(e.message || 'Could not load selected closure');
     }
@@ -1078,13 +1098,17 @@
   async function saveSelectedStormType() {
     if (!state.selectedStormId || !stormTypeSelect) return;
     const selectedType = stormTypeSelect.value || null;
+    const selectedKey = state.selectedClosureKey;
+    const selectedRow = state.closures.find((row) => closureRowKey(row) === selectedKey);
     try {
       const res = await fetch(`${API}/api/storms/${state.selectedStormId}/storm-type`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          dataset: state.selectedDataset,
-          storm_type: selectedType
+          storm_type: selectedType,
+          barrier: selectedRow?.barrier || null,
+          closure_start_utc: selectedRow?.closure_start_utc || null,
+          closure_end_utc: selectedRow?.closure_end_utc || null
         })
       });
       const data = await res.json().catch(() => ({}));
@@ -1094,20 +1118,19 @@
       }
       clearError();
       setStormTypeEditorValue(data.storm_type || '');
-      const selectedKey = state.selectedClosureKey;
       state.closures = state.closures.map((row) => (
         closureRowKey(row) === selectedKey
           ? { ...row, storm_type: data.storm_type || null }
           : row
       ));
       renderClosuresTable();
-      const selectedRow = state.closures.find((row) => closureRowKey(row) === selectedKey);
-      if (selectedRow && stormMeta) {
+      const updatedSelectedRow = state.closures.find((row) => closureRowKey(row) === selectedKey);
+      if (updatedSelectedRow && stormMeta) {
         stormMeta.innerHTML = `
-          <div><strong>Barrier:</strong> ${titleCaseBarrier(state.selectedDataset)}</div>
+          <div><strong>Barrier:</strong> ${titleCaseBarrier(state.selectedBarrier)}</div>
           <div><strong>Storm:</strong> ${data.storm || `storm_${state.selectedStormId}`}</div>
           <div><strong>Storm Type:</strong> ${displayStormType(data.storm_type)}</div>
-          <div><strong>Closure (UTC):</strong> ${formatIsoForDisplay(selectedRow.closure_start_utc)} - ${formatIsoForDisplay(selectedRow.closure_end_utc)}</div>
+          <div><strong>Closure (UTC):</strong> ${formatIsoForDisplay(updatedSelectedRow.closure_start_utc)} - ${formatIsoForDisplay(updatedSelectedRow.closure_end_utc)}</div>
         `;
       }
     } catch (e) {
@@ -1117,13 +1140,16 @@
     }
   }
 
-  function loadWaterLevelSeries(sid) {
+  function loadWaterLevelSeries(sid, barrier) {
     if (!sid) return;
     destroyWaterCharts();
     destroyWindowSlider();
     state.waterSeries = [];
     setWaterSeriesLoadingState(true);
-    const url = apiUrl(`/api/storms/${sid}/water_level_series`);
+    const qs = new URLSearchParams();
+    if (barrier) qs.set('barrier', barrier);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const url = apiUrl(`/api/storms/${sid}/water_level_series${suffix}`);
     fetch(url)
       .then(function (res) {
         setWaterSeriesLoadingState(false);
@@ -1132,50 +1158,57 @@
       })
       .then(function (data) {
         const series = data.series || [];
+        const availableEra5Windows = data.available_era5_windows || [];
         state.waterSeries = series;
         state.stormWindows = data.storm_windows || [];
-        if (series.length === 0) {
-          showWaterSeriesError('No water level data in window.');
-          return;
-        }
-        if (chartRangeSection) chartRangeSection.hidden = false;
-        waterLevelChartWrap.hidden = false;
+
+        if (chartRangeSection) chartRangeSection.hidden = series.length === 0;
+        waterLevelChartWrap.hidden = series.length === 0;
         era5WindowSection.hidden = false;
+
         const barrier = computeBarrierBounds();
         if (barrier) {
           state.barrierStartUtc = barrier.startUtc;
           state.barrierEndUtc = barrier.endUtc;
-          state.defaultCurrentUtc = barrier.endUtc;
+          state.defaultCurrentUtc = barrier.startUtc;
         } else {
           state.barrierStartUtc = null;
           state.barrierEndUtc = null;
           state.defaultCurrentUtc = null;
         }
-        const seriesStart = series[0].time_utc;
-        const seriesEnd = series[series.length - 1].time_utc;
+
+        const seriesStart = series[0] ? series[0].time_utc : null;
+        const seriesEnd = series.length ? series[series.length - 1].time_utc : null;
         const defaultStart = data.default_start_utc || seriesStart;
         const defaultEnd = data.default_end_utc || seriesEnd;
-        commitEra5Window(defaultStart, defaultEnd);
-        populateChartRangeControls();
-        // Default chart viewport to closure bounds +/- 62h when closures exist.
-        if (barrier) {
-          const barrierStartMs = new Date(barrier.startUtc).getTime();
-          const barrierEndMs = new Date(barrier.endUtc).getTime();
-          if (Number.isFinite(barrierStartMs) && Number.isFinite(barrierEndMs)) {
-            const hourMs = 3600000;
-            const chartStartIso = new Date(barrierStartMs - 62 * hourMs).toISOString();
-            const chartEndIso = new Date(barrierEndMs + 62 * hourMs).toISOString();
-            applyChartRange(chartStartIso, chartEndIso);
+        commitEra5Window(defaultStart || '', defaultEnd || '');
+
+        if (series.length > 0) {
+          populateChartRangeControls();
+          // Default chart viewport to closure bounds +/- 62h when closures exist.
+          if (barrier) {
+            const barrierStartMs = new Date(barrier.startUtc).getTime();
+            const barrierEndMs = new Date(barrier.endUtc).getTime();
+            if (Number.isFinite(barrierStartMs) && Number.isFinite(barrierEndMs)) {
+              const hourMs = 3600000;
+              const chartStartIso = new Date(barrierStartMs - 62 * hourMs).toISOString();
+              const chartEndIso = new Date(barrierEndMs + 62 * hourMs).toISOString();
+              applyChartRange(chartStartIso, chartEndIso);
+            } else {
+              applyChartRange(defaultStart, defaultEnd);
+            }
           } else {
             applyChartRange(defaultStart, defaultEnd);
           }
+          renderWaterLevelChart();
+          updateEra5LineAnnotations(state.era5StartUtc, state.era5EndUtc);
         } else {
-          applyChartRange(defaultStart, defaultEnd);
+          showWaterSeriesError('No water level data in window.');
         }
-        renderWaterLevelChart();
-        updateEra5LineAnnotations(state.era5StartUtc, state.era5EndUtc);
-        // Auto-render frames only when the exact default window is already cached.
-        if (data.default_window_cached) {
+
+        const preferredWindow = pickAutoLoadEra5Window(defaultStart, defaultEnd, availableEra5Windows);
+        if (preferredWindow && preferredWindow.start_utc && preferredWindow.end_utc) {
+          commitEra5Window(preferredWindow.start_utc, preferredWindow.end_utc);
           showApiStatus('Loading cached ERA5 window…');
           startStormSessionAutomatically(false);
         }
@@ -1317,7 +1350,7 @@
 
   updateEra5ApplyButtonDirtyState();
   if (barrierFilterSelect && barrierFilterSelect.value === 'thames') {
-    state.selectedDataset = 'thames';
+    state.selectedBarrier = 'thames';
   }
   updateGaugeLabel();
   loadClosures();
