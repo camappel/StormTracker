@@ -215,6 +215,19 @@ header h1 {
   margin-bottom: 0.75rem;
 }
 
+.anchor-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.anchor-status {
+  margin: 0.2rem 0 0.4rem 0;
+  font-size: 0.88rem;
+  color: #444;
+}
+
 .time-nav-row {
   margin-top: 0.75rem;
   padding: 0.5rem 0;
@@ -331,6 +344,14 @@ header h1 {
 
 .secondary-button.track-update-dirty:hover {
   background: #b56500;
+}
+
+.secondary-button.anchor-active {
+  background: #1976d2;
+}
+
+.secondary-button.anchor-active:hover {
+  background: #125ea7;
 }
 
 .button:disabled {

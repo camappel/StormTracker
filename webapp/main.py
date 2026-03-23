@@ -1113,6 +1113,17 @@ class TrackDeleteBody(BaseModel):
     time_index: int = -1
 
 
+TRACK_ANCHOR_ROLES = ("start", "closure_start", "end")
+
+
+class TrackAnchorSetBody(BaseModel):
+    session_id: str
+    role: str
+    lon: float
+    lat: float
+    time_index: int | None = None
+
+
 class ExportBody(BaseModel):
     product: Literal["era5", "gtsm", "side_by_side"]
     format: Literal["gif", "mp4"] = "gif"
@@ -1348,6 +1359,229 @@ def interpolate_pressure(session: dict, time_index: int, lon: float, lat: float)
     return val
 
 
+def _validate_anchor_role(role: str) -> str:
+    resolved = str(role or "").strip().lower()
+    if resolved not in TRACK_ANCHOR_ROLES:
+        allowed = ", ".join(TRACK_ANCHOR_ROLES)
+        raise HTTPException(status_code=400, detail=f"Invalid anchor role '{role}'. Allowed: {allowed}")
+    return resolved
+
+
+def _frame_index_for_iso(session: dict, iso_utc: str | None) -> int | None:
+    if not iso_utc:
+        return None
+    frame_list = session.get("frame_list") or []
+    if not frame_list:
+        return None
+    target = pd.Timestamp(iso_utc)
+    diffs = [abs(pd.Timestamp(t) - target) for _, t in frame_list]
+    if not diffs:
+        return None
+    return int(np.argmin(diffs))
+
+
+def _track_point_from_time_lon_lat(session: dict, time_index: int, lon: float, lat: float) -> dict:
+    frame_list = session.get("frame_list") or []
+    if time_index < 0 or time_index >= len(frame_list):
+        raise HTTPException(status_code=400, detail="Invalid time_index")
+    _, grid_time = frame_list[time_index]
+    pressure_hpa = interpolate_pressure(session, time_index, lon, lat)
+    return {
+        "time_utc": pd.Timestamp(grid_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "time_index": int(time_index),
+        "lon": round(float(lon), 6),
+        "lat": round(float(lat), 6),
+        "pressure_hpa": round(float(pressure_hpa), 2),
+    }
+
+
+def _set_track_anchor(
+    session: dict,
+    role: str,
+    lon: float,
+    lat: float,
+    time_index: int | None = None,
+) -> dict:
+    resolved_role = _validate_anchor_role(role)
+    frame_list = session.get("frame_list") or []
+    if not frame_list:
+        raise HTTPException(status_code=400, detail="Session has no frame list")
+    chosen_index = int(time_index) if time_index is not None else int(session.get("time_index", 0))
+    if resolved_role == "closure_start":
+        mapped = _frame_index_for_iso(session, session.get("closure_start_utc"))
+        if mapped is not None:
+            chosen_index = mapped
+    anchor = _track_point_from_time_lon_lat(session, chosen_index, lon, lat)
+    anchors = session.setdefault("track_anchors", {})
+    anchors[resolved_role] = anchor
+    return anchor
+
+
+def _display_bounds_indices(LON: np.ndarray, LAT: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    lon_in = (LON >= XB_MET[0]) & (LON <= XB_MET[1])
+    lat_in = (LAT >= YB_MET[0]) & (LAT <= YB_MET[1])
+    lon_inds = np.where(lon_in)[0]
+    lat_inds = np.where(lat_in)[0]
+    if len(lon_inds) < 3 or len(lat_inds) < 3:
+        # Fall back to whole grid if display bounds are too narrow.
+        lon_inds = np.arange(len(LON))
+        lat_inds = np.arange(len(LAT))
+    return lon_inds, lat_inds
+
+
+def _global_min_candidate(session: dict, time_index: int) -> dict:
+    frame_list = session.get("frame_list") or []
+    if time_index < 0 or time_index >= len(frame_list):
+        raise HTTPException(status_code=400, detail="Invalid time_index")
+    LON = session["LON"]
+    LAT = session["LAT"]
+    P_MET = session["P_MET"]
+    ti, grid_time = frame_list[time_index]
+    lon_inds, lat_inds = _display_bounds_indices(LON, LAT)
+    p_hpa = P_MET[ti, :, :] / 100.0
+    sub = p_hpa[np.ix_(lat_inds, lon_inds)]
+    iy, ix = np.unravel_index(int(np.argmin(sub)), sub.shape)
+    lat_idx = int(lat_inds[iy])
+    lon_idx = int(lon_inds[ix])
+    return {
+        "time_utc": pd.Timestamp(grid_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "time_index": int(time_index),
+        "lon": round(float(LON[lon_idx]), 6),
+        "lat": round(float(LAT[lat_idx]), 6),
+        "pressure_hpa": round(float(p_hpa[lat_idx, lon_idx]), 2),
+    }
+
+
+def _local_minima_candidates(session: dict, time_index: int, max_candidates: int = 40) -> list[dict]:
+    frame_list = session.get("frame_list") or []
+    if time_index < 0 or time_index >= len(frame_list):
+        raise HTTPException(status_code=400, detail="Invalid time_index")
+    LON = session["LON"]
+    LAT = session["LAT"]
+    P_MET = session["P_MET"]
+    ti, grid_time = frame_list[time_index]
+    lon_inds, lat_inds = _display_bounds_indices(LON, LAT)
+    p_hpa = P_MET[ti, :, :] / 100.0
+    sub = p_hpa[np.ix_(lat_inds, lon_inds)]
+    if sub.shape[0] < 3 or sub.shape[1] < 3:
+        return [_global_min_candidate(session, time_index)]
+
+    candidates: list[dict] = []
+    for yi in range(1, sub.shape[0] - 1):
+        for xi in range(1, sub.shape[1] - 1):
+            center = float(sub[yi, xi])
+            patch = sub[yi - 1 : yi + 2, xi - 1 : xi + 2]
+            neigh = np.asarray(patch).ravel()
+            # Remove center value from neighborhood comparison.
+            neigh = np.delete(neigh, 4)
+            if np.all(center <= neigh) and np.any(center < neigh):
+                lat_idx = int(lat_inds[yi])
+                lon_idx = int(lon_inds[xi])
+                candidates.append(
+                    {
+                        "time_utc": pd.Timestamp(grid_time).strftime("%Y-%m-%d %H:%M:%S"),
+                        "time_index": int(time_index),
+                        "lon": round(float(LON[lon_idx]), 6),
+                        "lat": round(float(LAT[lat_idx]), 6),
+                        "pressure_hpa": round(center, 2),
+                    }
+                )
+
+    if not candidates:
+        candidates = [_global_min_candidate(session, time_index)]
+    candidates.sort(key=lambda c: float(c["pressure_hpa"]))
+    return candidates[: int(max(1, max_candidates))]
+
+
+def _deg_distance(a: dict, b: dict) -> float:
+    return float(np.hypot(float(a["lon"]) - float(b["lon"]), float(a["lat"]) - float(b["lat"])))
+
+
+def _pick_next_minimum(
+    prev_point: dict,
+    goal_point: dict,
+    candidates: list[dict],
+    steps_left: int,
+    prev_prev_point: dict | None = None,
+) -> dict:
+    if not candidates:
+        return goal_point
+    best = candidates[0]
+    best_score = np.inf
+    # Anchor pressure level as a rough target to avoid drifting to shallow minima.
+    goal_pressure = float(goal_point.get("pressure_hpa") or 1010.0)
+    for c in candidates:
+        d_prev = _deg_distance(prev_point, c)
+        d_goal = _deg_distance(c, goal_point)
+        p_term = max(0.0, float(c.get("pressure_hpa") or 1010.0) - goal_pressure)
+        smooth = 0.0
+        if prev_prev_point is not None:
+            pred = {
+                "lon": float(prev_point["lon"]) + (float(prev_point["lon"]) - float(prev_prev_point["lon"])),
+                "lat": float(prev_point["lat"]) + (float(prev_point["lat"]) - float(prev_prev_point["lat"])),
+            }
+            smooth = float(np.hypot(float(c["lon"]) - pred["lon"], float(c["lat"]) - pred["lat"]))
+        score = (
+            1.0 * d_prev
+            + 0.35 * (d_goal / max(1, steps_left))
+            + 0.2 * (p_term / 5.0)
+            + 0.25 * smooth
+        )
+        if score < best_score:
+            best = c
+            best_score = score
+    return best
+
+
+def _track_segment_between_anchors(session: dict, start_anchor: dict, end_anchor: dict) -> list[dict]:
+    start_idx = int(start_anchor["time_index"])
+    end_idx = int(end_anchor["time_index"])
+    if end_idx < start_idx:
+        raise HTTPException(status_code=400, detail="Invalid anchor ordering for segment")
+    if end_idx == start_idx:
+        return [start_anchor]
+
+    out = [start_anchor]
+    prev = start_anchor
+    prev_prev = None
+    for idx in range(start_idx + 1, end_idx):
+        candidates = _local_minima_candidates(session, idx)
+        steps_left = end_idx - idx
+        chosen = _pick_next_minimum(prev, end_anchor, candidates, steps_left, prev_prev_point=prev_prev)
+        # Recompute pressure using interpolation to keep consistent precision.
+        chosen = _track_point_from_time_lon_lat(session, idx, float(chosen["lon"]), float(chosen["lat"]))
+        out.append(chosen)
+        prev_prev = prev
+        prev = chosen
+    out.append(end_anchor)
+    return out
+
+
+def _anchors_from_session_or_422(session: dict) -> tuple[dict, dict, dict]:
+    anchors = session.get("track_anchors") or {}
+    missing = [k for k in TRACK_ANCHOR_ROLES if k not in anchors]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Missing required anchors: {', '.join(missing)}. Set start, closure_start, and end anchors first.",
+        )
+    start_anchor = anchors["start"]
+    closure_anchor = anchors["closure_start"]
+    end_anchor = anchors["end"]
+    s_idx = int(start_anchor["time_index"])
+    c_idx = int(closure_anchor["time_index"])
+    e_idx = int(end_anchor["time_index"])
+    if not (s_idx <= c_idx <= e_idx):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Anchor times must be ordered start <= closure_start <= end. "
+                "Please reset anchors on the correct frames."
+            ),
+        )
+    return start_anchor, closure_anchor, end_anchor
+
+
 def get_session(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found or expired")
@@ -1362,6 +1596,7 @@ def _create_session_from_era5(
     window_end_utc: str | None = None,
     track_window_start_utc: str | None = None,
     track_window_end_utc: str | None = None,
+    closure_start_utc: str | None = None,
 ) -> dict:
     barrier_key = _normalize_barrier(barrier) if barrier else DEFAULT_BARRIER
     data = parse_era5(path)
@@ -1385,8 +1620,10 @@ def _create_session_from_era5(
         "barrier": barrier_key,
         "window_start_utc": window_start_utc,
         "window_end_utc": window_end_utc,
+        "closure_start_utc": _normalize_iso_utc(closure_start_utc),
         **data,
         "track": persisted_track,
+        "track_anchors": {},
         "last_access": time.time(),
     }
     frame_list = data["frame_list"]
@@ -1398,6 +1635,7 @@ def _create_session_from_era5(
         "session_id": session_id,
         "times": times,
         "track": persisted_track,
+        "track_anchors": {},
         "gtsm_available": any(p.exists() for p in CODEC_GTSM_DIRS),
         "bounds": {
             "lon_min": XB_MET[0],
@@ -1414,6 +1652,7 @@ class StartStormSessionBody(BaseModel):
     end_utc: str
     barrier: str | None = None
     dataset: str | None = None
+    closure_start_utc: str | None = None
 
 
 def _parse_iso_utc(dt_str: str) -> datetime:
@@ -1635,6 +1874,7 @@ async def api_start_storm_session(body: StartStormSessionBody):
         window_end_utc=end_iso,
         track_window_start_utc=track_window_start,
         track_window_end_utc=track_window_end,
+        closure_start_utc=body.closure_start_utc,
     )
     sid = session_payload["session_id"]
     _build_session_gtsm_subset(sessions[sid])
@@ -2085,6 +2325,40 @@ async def api_get_track(session_id: str):
     session = get_session(session_id)
     session["last_access"] = time.time()
     return {"track": session["track"]}
+
+
+@app.get("/api/track/anchors/{session_id}")
+async def api_get_track_anchors(session_id: str):
+    session = get_session(session_id)
+    session["last_access"] = time.time()
+    return {"track_anchors": session.get("track_anchors") or {}}
+
+
+@app.post("/api/track/anchors/set")
+async def api_set_track_anchor(body: TrackAnchorSetBody):
+    session = get_session(body.session_id)
+    session["last_access"] = time.time()
+    anchor = _set_track_anchor(
+        session,
+        role=body.role,
+        lon=float(body.lon),
+        lat=float(body.lat),
+        time_index=body.time_index,
+    )
+    return {"track_anchors": session.get("track_anchors") or {}, "anchor": anchor}
+
+
+@app.post("/api/track/autolabel/{session_id}")
+async def api_track_autolabel(session_id: str):
+    session = get_session(session_id)
+    session["last_access"] = time.time()
+    start_anchor, closure_anchor, end_anchor = _anchors_from_session_or_422(session)
+    seg_a = _track_segment_between_anchors(session, start_anchor, closure_anchor)
+    seg_b = _track_segment_between_anchors(session, closure_anchor, end_anchor)
+    full_track = seg_a + seg_b[1:]
+    full_track.sort(key=lambda p: int(p["time_index"]))
+    session["track"] = full_track
+    return {"track": full_track, "track_anchors": session.get("track_anchors") or {}}
 
 
 @app.post("/api/track/add")

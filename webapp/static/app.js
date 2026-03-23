@@ -33,7 +33,9 @@
     trackDirty: false,
     exportBusy: false,
     selectedBarrier: 'eastern_scheldt',
-    selectedStormType: null
+    selectedStormType: null,
+    trackAnchors: {},
+    activeAnchorRole: null
   };
 
   const BARRIER_META = {
@@ -89,6 +91,12 @@
   const btnExportEra5 = document.getElementById('btn-export-era5');
   const btnExportGtsm = document.getElementById('btn-export-gtsm');
   const btnExportSideBySide = document.getElementById('btn-export-side-by-side');
+  const btnAnchorStart = document.getElementById('btn-anchor-start');
+  const btnAnchorClosure = document.getElementById('btn-anchor-closure');
+  const btnAnchorEnd = document.getElementById('btn-anchor-end');
+  const btnAnchorClear = document.getElementById('btn-anchor-clear');
+  const btnTrackAutogen = document.getElementById('btn-track-autogen');
+  const trackAnchorStatus = document.getElementById('track-anchor-status');
   const trackInfo = document.getElementById('track-info');
   const stormTypeEditor = document.getElementById('storm-type-editor');
   const stormTypeSelect = document.getElementById('storm-type-select');
@@ -346,6 +354,8 @@
 
   function updateTrackButtonState() {
     const n = state.track.length;
+    const anchors = state.trackAnchors || {};
+    const hasAllAnchors = !!(anchors.start && anchors.closure_start && anchors.end);
     const canActOnTrack = !!state.sessionId && n > 0;
     btnUpdateTrack.disabled = !canActOnTrack;
     btnUpdateTrack.classList.toggle('track-update-dirty', n > 0 && state.trackDirty);
@@ -353,6 +363,9 @@
     [btnExportEra5, btnExportGtsm, btnExportSideBySide].forEach((btn) => {
       if (btn) btn.disabled = exportDisabled;
     });
+    if (btnTrackAutogen) {
+      btnTrackAutogen.disabled = !state.sessionId || !hasAllAnchors || state.exportBusy;
+    }
   }
 
   function updateTrackInfo() {
@@ -365,6 +378,82 @@
       trackInfo.textContent = `${n} track point(s).`;
     }
     updateTrackButtonState();
+    updateAnchorUi();
+  }
+
+  function anchorDisplayText(anchor) {
+    if (!anchor) return 'missing';
+    const ti = Number.isFinite(Number(anchor.time_index)) ? `@${Number(anchor.time_index) + 1}` : '@?';
+    return `${ti} (${Number(anchor.lon).toFixed(2)}, ${Number(anchor.lat).toFixed(2)})`;
+  }
+
+  function setActiveAnchorRole(role) {
+    state.activeAnchorRole = role || null;
+    [btnAnchorStart, btnAnchorClosure, btnAnchorEnd].forEach((btn) => {
+      if (!btn) return;
+      btn.classList.remove('anchor-active');
+    });
+    if (state.activeAnchorRole === 'start' && btnAnchorStart) btnAnchorStart.classList.add('anchor-active');
+    if (state.activeAnchorRole === 'closure_start' && btnAnchorClosure) btnAnchorClosure.classList.add('anchor-active');
+    if (state.activeAnchorRole === 'end' && btnAnchorEnd) btnAnchorEnd.classList.add('anchor-active');
+    updateAnchorUi();
+  }
+
+  function updateAnchorUi() {
+    if (!trackAnchorStatus) return;
+    const anchors = state.trackAnchors || {};
+    const mode = state.activeAnchorRole ? `Mode: set ${state.activeAnchorRole}` : 'Mode: normal track edit';
+    trackAnchorStatus.textContent =
+      `Anchors — start ${anchorDisplayText(anchors.start)}, closure_start ${anchorDisplayText(anchors.closure_start)}, end ${anchorDisplayText(anchors.end)}. ${mode}.`;
+  }
+
+  async function setTrackAnchor(role, lon, lat) {
+    if (!state.sessionId) return;
+    const data = await postTrackAction(
+      '/api/track/anchors/set',
+      {
+        session_id: state.sessionId,
+        role,
+        lon,
+        lat,
+        time_index: state.timeIndex
+      },
+      'Failed to set anchor'
+    );
+    if (!data) return;
+    state.trackAnchors = data.track_anchors || {};
+    updateAnchorUi();
+    updateTrackButtonState();
+  }
+
+  async function autoGenerateTrack() {
+    if (!state.sessionId || state.exportBusy) return;
+    const anchors = state.trackAnchors || {};
+    if (!(anchors.start && anchors.closure_start && anchors.end)) {
+      showError('Set start, closure_start, and end anchors first.');
+      return;
+    }
+    try {
+      setExportBusy(true);
+      clearError();
+      showApiStatus('Auto-generating storm track from anchors…');
+      const res = await fetch(`${API}/api/track/autolabel/${state.sessionId}`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        clearApiStatus();
+        showError(data.detail || 'Failed to auto-generate track');
+        return;
+      }
+      clearApiStatus();
+      state.trackAnchors = data.track_anchors || state.trackAnchors;
+      setTrackAndRefresh(data.track || [], { reloadFrame: true, markDirty: true });
+    } catch (e) {
+      clearApiStatus();
+      showError('Network error: ' + e.message);
+    } finally {
+      setExportBusy(false);
+      updateTrackButtonState();
+    }
   }
 
   function setTrackAndRefresh(track, options = {}) {
@@ -675,7 +764,8 @@
           storm_id: state.selectedStormId,
           start_utc: startIso,
           end_utc: endIso,
-          barrier: state.selectedBarrier
+          barrier: state.selectedBarrier,
+          closure_start_utc: state.selectedClosureStartUtc
         })
       });
       const data = await res.json();
@@ -883,6 +973,8 @@
     state.activeStartIdx = 0;
     state.activeEndIdx = Math.max(0, state.times.length - 1);
     state.timeIndex = state.activeStartIdx;
+    state.trackAnchors = data.track_anchors || {};
+    setActiveAnchorRole(null);
     const currentAnchorIso = state.selectedClosureStartUtc || state.defaultCurrentUtc;
     const currentMs = currentAnchorIso ? new Date(currentAnchorIso).getTime() : NaN;
     if (Number.isFinite(currentMs)) {
@@ -1010,8 +1102,11 @@
     state.waterSeries = [];
     state.stormWindows = [];
     state.selectedStormType = null;
+    state.trackAnchors = {};
+    state.activeAnchorRole = null;
     commitEra5Window('', '');
     setTrackAndRefresh([]);
+    updateAnchorUi();
   }
 
   function resetStormUiState() {
@@ -1240,6 +1335,10 @@
     }
     const pt = pixelToLonLat(x, y);
     if (!pt) return;
+    if (state.activeAnchorRole) {
+      setTrackAnchor(state.activeAnchorRole, pt.lon, pt.lat);
+      return;
+    }
     addPoint(pt.lon, pt.lat);
   });
 
@@ -1293,6 +1392,36 @@
   if (btnExportSideBySide) {
     btnExportSideBySide.addEventListener('click', () => {
       exportAnimation('side_by_side');
+    });
+  }
+
+  if (btnAnchorStart) {
+    btnAnchorStart.addEventListener('click', () => {
+      setActiveAnchorRole(state.activeAnchorRole === 'start' ? null : 'start');
+    });
+  }
+
+  if (btnAnchorClosure) {
+    btnAnchorClosure.addEventListener('click', () => {
+      setActiveAnchorRole(state.activeAnchorRole === 'closure_start' ? null : 'closure_start');
+    });
+  }
+
+  if (btnAnchorEnd) {
+    btnAnchorEnd.addEventListener('click', () => {
+      setActiveAnchorRole(state.activeAnchorRole === 'end' ? null : 'end');
+    });
+  }
+
+  if (btnAnchorClear) {
+    btnAnchorClear.addEventListener('click', () => {
+      setActiveAnchorRole(null);
+    });
+  }
+
+  if (btnTrackAutogen) {
+    btnTrackAutogen.addEventListener('click', () => {
+      autoGenerateTrack();
     });
   }
 
@@ -1353,5 +1482,6 @@
     state.selectedBarrier = 'thames';
   }
   updateGaugeLabel();
+  updateAnchorUi();
   loadClosures();
 })();

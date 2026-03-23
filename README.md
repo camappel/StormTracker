@@ -36,7 +36,13 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-Open http://localhost:8000 — upload a `.nc` file (ERA5 format: `msl`, `u10`, `v10`, `valid_time`, `latitude`, `longitude`), use Prev/Next to step through time, click to add track points (or switch to "Delete point" and click to remove), then click `Update Storm Track` to persist changes.
+Open http://localhost:8000 — select a closure, set ERA5 window, then use anchor mode to set:
+
+- `start` storm position,
+- `closure_start` storm position,
+- `end` storm position,
+
+and click `Auto-generate track` to fill all intermediate frames by tracking local pressure minima. You can still edit points manually on the map, then click `Update Storm Track` to persist.
 
 Startup order in the UI:
 
@@ -82,6 +88,9 @@ Optional: add `railway.toml` in the same directory (included) to pin the start c
 - `POST /api/track/add` — JSON `{ session_id, time_index, lon, lat }` → append point (pressure interpolated)
 - `POST /api/track/delete` — JSON `{ session_id, time_index }` (or `time_index: -1` to remove last)
 - `GET /api/track/<session_id>` — current track as JSON
+- `GET /api/track/anchors/<session_id>` — current anchor points (`start`, `closure_start`, `end`)
+- `POST /api/track/anchors/set` — JSON `{ session_id, role, lon, lat, time_index? }` → set required anchor point
+- `POST /api/track/autolabel/<session_id>` — auto-generate full track between anchors by local-minimum tracking
 - `POST /api/track/update/<session_id>` — persist track to `data/storm_track/track_<start>_<end>.json` (ERA5 window key) and persist derived `storm_window` (min/max labelled frame times) into `data/<dataset>/storms.json`
 
 Sessions are in-memory for live editing, but storm tracks are persisted once per ERA5 window under `data/storm_track`.

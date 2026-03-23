@@ -15,7 +15,7 @@
   <div id="app">
     <header>
       <h1>StormTracker ERA5</h1>
-      <p class="subtitle">Select a closure, inspect water levels, choose ERA5 dates, then click to draw the track.</p>
+      <p class="subtitle">Select a closure, inspect water levels, choose ERA5 dates, set start/closure/end anchors, then auto-generate the track.</p>
     </header>
 
     <section id="storm-section">
@@ -109,7 +109,16 @@
           <p id="upload-error" class="error" hidden></p>
           <section id="map-section" hidden>
             <div class="controls">
+              <div class="anchor-toolbar">
+                <span class="window-label">Anchor mode:</span>
+                <button type="button" id="btn-anchor-start" class="button secondary-button">Set start</button>
+                <button type="button" id="btn-anchor-closure" class="button secondary-button">Set closure start</button>
+                <button type="button" id="btn-anchor-end" class="button secondary-button">Set end</button>
+                <button type="button" id="btn-anchor-clear" class="button secondary-button">Clear mode</button>
+                <button type="button" id="btn-track-autogen" class="button secondary-button">Auto-generate track</button>
+              </div>
             </div>
+            <p id="track-anchor-status" class="anchor-status">Anchors: start missing, closure_start missing, end missing.</p>
             <div class="time-nav-row">
               <div id="time-window-slider" class="window-range-slider"></div>
             </div>
