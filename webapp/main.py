@@ -1114,6 +1114,8 @@ class TrackDeleteBody(BaseModel):
 
 
 TRACK_ANCHOR_ROLES = ("start", "closure_start", "end")
+ANCHOR_SNAP_MAX_DISTANCE_DEG = 2.5
+FRAME_CANDIDATE_COUNT = 5
 
 
 class TrackAnchorSetBody(BaseModel):
@@ -1395,13 +1397,53 @@ def _track_point_from_time_lon_lat(session: dict, time_index: int, lon: float, l
     }
 
 
+def _anchor_snap_to_nearest_local_minimum(
+    session: dict,
+    time_index: int,
+    clicked_lon: float,
+    clicked_lat: float,
+    max_distance_deg: float = ANCHOR_SNAP_MAX_DISTANCE_DEG,
+) -> dict:
+    candidates = _local_minima_candidates(session, time_index)
+    clicked = {"lon": float(clicked_lon), "lat": float(clicked_lat)}
+    if not candidates:
+        return {
+            "clicked": clicked,
+            "snapped": clicked,
+            "distance_deg": 0.0,
+            "used_fallback": True,
+            "fallback_reason": "no_local_minimum_candidates",
+        }
+
+    nearest = min(
+        candidates,
+        key=lambda c: float(np.hypot(float(c["lon"]) - clicked["lon"], float(c["lat"]) - clicked["lat"])),
+    )
+    distance = float(np.hypot(float(nearest["lon"]) - clicked["lon"], float(nearest["lat"]) - clicked["lat"]))
+    if distance <= float(max_distance_deg):
+        return {
+            "clicked": clicked,
+            "snapped": {"lon": float(nearest["lon"]), "lat": float(nearest["lat"])},
+            "distance_deg": round(distance, 4),
+            "used_fallback": False,
+            "fallback_reason": None,
+        }
+    return {
+        "clicked": clicked,
+        "snapped": clicked,
+        "distance_deg": round(distance, 4),
+        "used_fallback": True,
+        "fallback_reason": "nearest_minimum_too_far",
+    }
+
+
 def _set_track_anchor(
     session: dict,
     role: str,
     lon: float,
     lat: float,
     time_index: int | None = None,
-) -> dict:
+) -> tuple[dict, dict]:
     resolved_role = _validate_anchor_role(role)
     frame_list = session.get("frame_list") or []
     if not frame_list:
@@ -1411,10 +1453,13 @@ def _set_track_anchor(
         mapped = _frame_index_for_iso(session, session.get("closure_start_utc"))
         if mapped is not None:
             chosen_index = mapped
-    anchor = _track_point_from_time_lon_lat(session, chosen_index, lon, lat)
+    snap = _anchor_snap_to_nearest_local_minimum(session, chosen_index, float(lon), float(lat))
+    snapped_lon = float((snap.get("snapped") or {}).get("lon", lon))
+    snapped_lat = float((snap.get("snapped") or {}).get("lat", lat))
+    anchor = _track_point_from_time_lon_lat(session, chosen_index, snapped_lon, snapped_lat)
     anchors = session.setdefault("track_anchors", {})
     anchors[resolved_role] = anchor
-    return anchor
+    return anchor, snap
 
 
 def _display_bounds_indices(LON: np.ndarray, LAT: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1904,6 +1949,24 @@ async def api_frame(session_id: str, time_index: int):
     return Response(content=png_bytes, media_type="image/png")
 
 
+@app.get("/api/track/candidates/{session_id}/{time_index}")
+async def api_track_candidates(session_id: str, time_index: int):
+    session = get_session(session_id)
+    session["last_access"] = time.time()
+    frame_list = session.get("frame_list") or []
+    if time_index < 0 or time_index >= len(frame_list):
+        raise HTTPException(status_code=404, detail="Invalid time_index")
+    _, grid_time = frame_list[time_index]
+    candidates = _local_minima_candidates(session, time_index, max_candidates=FRAME_CANDIDATE_COUNT)
+    return {
+        "session_id": session_id,
+        "time_index": int(time_index),
+        "time_utc": pd.Timestamp(grid_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "candidates": candidates,
+        "count": len(candidates),
+    }
+
+
 def _codec_gtsm_root() -> Path | None:
     for root in CODEC_GTSM_DIRS:
         if root.exists():
@@ -2338,14 +2401,18 @@ async def api_get_track_anchors(session_id: str):
 async def api_set_track_anchor(body: TrackAnchorSetBody):
     session = get_session(body.session_id)
     session["last_access"] = time.time()
-    anchor = _set_track_anchor(
+    anchor, snap = _set_track_anchor(
         session,
         role=body.role,
         lon=float(body.lon),
         lat=float(body.lat),
         time_index=body.time_index,
     )
-    return {"track_anchors": session.get("track_anchors") or {}, "anchor": anchor}
+    return {
+        "track_anchors": session.get("track_anchors") or {},
+        "anchor": anchor,
+        "snap": snap,
+    }
 
 
 @app.post("/api/track/autolabel/{session_id}")

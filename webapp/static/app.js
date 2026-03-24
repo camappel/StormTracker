@@ -35,7 +35,11 @@
     selectedBarrier: 'eastern_scheldt',
     selectedStormType: null,
     trackAnchors: {},
-    activeAnchorRole: null
+    activeAnchorRole: null,
+    lastAnchorSnapMessage: '',
+    frameCandidates: [],
+    candidateFetchKey: null,
+    candidateFetchRequestId: 0
   };
 
   const BARRIER_META = {
@@ -164,6 +168,83 @@
       x: rect.left + fracX * w,
       y: rect.top + fracY * h
     };
+  }
+
+  function lonLatToCanvasPoint(lon, lat) {
+    const b = state.bounds;
+    if (!b || !clickLayer || clickLayer.width <= 0 || clickLayer.height <= 0) return null;
+    const fracX = (Number(lon) - b.lon_min) / (b.lon_max - b.lon_min);
+    const fracY = (b.lat_max - Number(lat)) / (b.lat_max - b.lat_min);
+    if (!Number.isFinite(fracX) || !Number.isFinite(fracY)) return null;
+    if (fracX < 0 || fracX > 1 || fracY < 0 || fracY > 1) return null;
+    return {
+      x: fracX * clickLayer.width,
+      y: fracY * clickLayer.height
+    };
+  }
+
+  function drawFrameCandidates() {
+    if (!clickLayer) return;
+    const ctx = clickLayer.getContext('2d');
+    if (!ctx) return;
+    const w = clickLayer.width;
+    const h = clickLayer.height;
+    if (w <= 0 || h <= 0) return;
+    ctx.clearRect(0, 0, w, h);
+    const candidates = state.frameCandidates || [];
+    candidates.forEach((c, idx) => {
+      const pt = lonLatToCanvasPoint(c.lon, c.lat);
+      if (!pt) return;
+      const label = String(idx + 1);
+      const r = 9;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255, 112, 67, 0.92)';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.9)';
+      ctx.stroke();
+      ctx.font = 'bold 11px system-ui, -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(label, pt.x, pt.y);
+    });
+  }
+
+  async function requestFrameCandidates(options = {}) {
+    const force = !!options.force;
+    if (!state.sessionId || !state.bounds) {
+      state.frameCandidates = [];
+      state.candidateFetchKey = null;
+      drawFrameCandidates();
+      return;
+    }
+    const key = `${state.sessionId}|${state.timeIndex}`;
+    if (!force && state.candidateFetchKey === key) {
+      drawFrameCandidates();
+      return;
+    }
+    const requestId = ++state.candidateFetchRequestId;
+    try {
+      const res = await fetch(`${API}/api/track/candidates/${state.sessionId}/${state.timeIndex}`);
+      const data = await res.json().catch(() => ({}));
+      if (requestId !== state.candidateFetchRequestId) return;
+      if (!res.ok) {
+        state.frameCandidates = [];
+        state.candidateFetchKey = key;
+        drawFrameCandidates();
+        return;
+      }
+      state.frameCandidates = Array.isArray(data.candidates) ? data.candidates : [];
+      state.candidateFetchKey = key;
+      drawFrameCandidates();
+    } catch (e) {
+      if (requestId !== state.candidateFetchRequestId) return;
+      state.frameCandidates = [];
+      state.candidateFetchKey = key;
+      drawFrameCandidates();
+    }
   }
 
   function getClickedTrackPointTimeIndex(x, y) {
@@ -403,8 +484,22 @@
     if (!trackAnchorStatus) return;
     const anchors = state.trackAnchors || {};
     const mode = state.activeAnchorRole ? `Mode: set ${state.activeAnchorRole}` : 'Mode: normal track edit';
+    const snapInfo = state.lastAnchorSnapMessage ? ` ${state.lastAnchorSnapMessage}` : '';
     trackAnchorStatus.textContent =
-      `Anchors — start ${anchorDisplayText(anchors.start)}, closure_start ${anchorDisplayText(anchors.closure_start)}, end ${anchorDisplayText(anchors.end)}. ${mode}.`;
+      `Anchors — start ${anchorDisplayText(anchors.start)}, closure_start ${anchorDisplayText(anchors.closure_start)}, end ${anchorDisplayText(anchors.end)}. ${mode}.${snapInfo}`;
+  }
+
+  function formatSnapMessage(role, snap) {
+    if (!snap || !snap.clicked || !snap.snapped) return '';
+    const roleLabel = String(role || '').toLowerCase();
+    const clicked = snap.clicked;
+    const snapped = snap.snapped;
+    const d = Number(snap.distance_deg);
+    const dText = Number.isFinite(d) ? `${d.toFixed(2)}deg` : 'n/a';
+    if (snap.used_fallback) {
+      return `Last set ${roleLabel}: no nearby local minimum (nearest ${dText}); kept clicked position.`;
+    }
+    return `Last set ${roleLabel}: snapped to nearest local minimum (${dText}).`;
   }
 
   async function setTrackAnchor(role, lon, lat) {
@@ -422,6 +517,7 @@
     );
     if (!data) return;
     state.trackAnchors = data.track_anchors || {};
+    state.lastAnchorSnapMessage = formatSnapMessage(role, data.snap);
     updateAnchorUi();
     updateTrackButtonState();
   }
@@ -543,6 +639,7 @@
 
   function loadFrame() {
     if (!state.sessionId) return;
+    requestFrameCandidates();
     const url = `${API}/api/frame/${state.sessionId}/${state.timeIndex}`;
     frameImg.src = url + '?t=' + Date.now();
     if (gtsmFrameImg) {
@@ -973,7 +1070,10 @@
     state.activeStartIdx = 0;
     state.activeEndIdx = Math.max(0, state.times.length - 1);
     state.timeIndex = state.activeStartIdx;
+    state.frameCandidates = [];
+    state.candidateFetchKey = null;
     state.trackAnchors = data.track_anchors || {};
+    state.lastAnchorSnapMessage = '';
     setActiveAnchorRole(null);
     const currentAnchorIso = state.selectedClosureStartUtc || state.defaultCurrentUtc;
     const currentMs = currentAnchorIso ? new Date(currentAnchorIso).getTime() : NaN;
@@ -1104,9 +1204,14 @@
     state.selectedStormType = null;
     state.trackAnchors = {};
     state.activeAnchorRole = null;
+    state.lastAnchorSnapMessage = '';
+    state.frameCandidates = [];
+    state.candidateFetchKey = null;
+    state.candidateFetchRequestId = 0;
     commitEra5Window('', '');
     setTrackAndRefresh([]);
     updateAnchorUi();
+    drawFrameCandidates();
   }
 
   function resetStormUiState() {
@@ -1349,6 +1454,11 @@
     clickLayer.height = h;
     clickLayer.style.width = '100%';
     clickLayer.style.height = 'auto';
+    requestFrameCandidates();
+    drawFrameCandidates();
+  });
+  window.addEventListener('resize', () => {
+    drawFrameCandidates();
   });
   if (barrierFilterSelect) {
     barrierFilterSelect.addEventListener('change', () => {
