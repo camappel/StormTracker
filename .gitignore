@@ -10,3 +10,5 @@ webapp/.venv/
 .idea/
 .vscode/
 libs/
+webapp/.venv/
+webapp/__pycache__/
