@@ -6,6 +6,7 @@
     es: "ES",
     both: "Both"
   };
+  const HYDRO_BARRIERS = ["thames", "eastern_scheldt"];
   const FRAME_PRODUCTS = [
     { key: "era5", label: "ERA5 MSLP" },
     { key: "wind", label: "ERA5 wind" },
@@ -147,7 +148,6 @@
     const previousStormId = state.selectedStormId;
     if (!storms.some(function (storm) { return storm.storm_id === state.selectedStormId; })) {
       state.selectedStormId = storms[0] ? storms[0].storm_id : null;
-      state.selectedHydroBarrier = null;
     }
     if (previousStormId !== state.selectedStormId) {
       state.frameIndex = 0;
@@ -252,7 +252,6 @@
 
       button.addEventListener("click", function () {
         state.selectedStormId = storm.storm_id;
-        state.selectedHydroBarrier = null;
         state.frameIndex = 0;
         render();
       });
@@ -291,15 +290,17 @@
 
   function renderHydroSwitch(storm) {
     const barriers = hydroBarriers(storm);
-    if (!state.selectedHydroBarrier || !barriers.includes(state.selectedHydroBarrier)) {
-      state.selectedHydroBarrier = barriers[0] || "thames";
+    const selected = normalizeBarrier(state.selectedHydroBarrier);
+    if (!selected || !barriers.includes(selected)) {
+      state.selectedHydroBarrier = preferredHydroBarrier(storm, barriers);
     }
     els.hydroSwitch.innerHTML = "";
     barriers.forEach(function (barrier) {
       const button = document.createElement("button");
       button.type = "button";
-      button.className = barrier === state.selectedHydroBarrier ? "is-active" : "";
+      button.className = barrier === normalizeBarrier(state.selectedHydroBarrier) ? "is-active" : "";
       button.textContent = barrierLabel(barrier);
+      button.title = hydroSwitchTitle(storm, barrier);
       button.addEventListener("click", function () {
         state.selectedHydroBarrier = barrier;
         renderMetrics(storm);
@@ -311,11 +312,39 @@
   }
 
   function hydroBarriers(storm) {
-    const fromData = Object.keys(storm.series || {}).filter(function (key) {
-      return storm.series[key] && Array.isArray(storm.series[key].points) && storm.series[key].points.length > 0;
+    return HYDRO_BARRIERS.slice();
+  }
+
+  function preferredHydroBarrier(storm, barriers) {
+    const closureBarrier = barriers.find(function (barrier) {
+      return (storm.closures || []).some(function (closure) {
+        return normalizeBarrier(closure.barrier) === barrier;
+      });
     });
-    if (fromData.length) return fromData;
-    return storm.barriers && storm.barriers.length ? storm.barriers : ["thames", "eastern_scheldt"];
+    return barriers.find(function (barrier) {
+      return hasObservedSeries(storm, barrier);
+    }) || closureBarrier || barriers.find(function (barrier) {
+      return hasGtsmSeries(storm, barrier);
+    }) || barriers[0] || "thames";
+  }
+
+  function hasObservedSeries(storm, barrier) {
+    const series = storm.series && storm.series[normalizeBarrier(barrier)];
+    return !!(series && Array.isArray(series.points) && series.points.length);
+  }
+
+  function hasGtsmSeries(storm, barrier) {
+    const gauges = storm && storm.gtsm_series && storm.gtsm_series.gauges;
+    const gauge = gaugeKeyForBarrier(barrier);
+    const points = gauges && gauges[gauge] && gauges[gauge].points;
+    return Array.isArray(points) && points.length > 0;
+  }
+
+  function hydroSwitchTitle(storm, barrier) {
+    const label = barrierLabel(barrier);
+    if (hasObservedSeries(storm, barrier)) return `${label} observed hydrograph available`;
+    if (hasGtsmSeries(storm, barrier)) return `${label} GTSM series available`;
+    return `${label} data unavailable for this storm window`;
   }
 
   function renderMetrics(storm) {
@@ -542,7 +571,7 @@
     if (!series || !series.points || !series.points.length) {
       destroyHydroChart();
       clearCanvas(canvas, "No water-level data in this window");
-      els.hydroCaption.textContent = barrierLabel(state.selectedHydroBarrier);
+      els.hydroCaption.textContent = `${barrierLabel(state.selectedHydroBarrier)} | no observed data`;
       return;
     }
 
@@ -550,7 +579,7 @@
     if (!points.length || !hydroValues(points).length) {
       destroyHydroChart();
       clearCanvas(canvas, "No finite values in this window");
-      els.hydroCaption.textContent = barrierLabel(state.selectedHydroBarrier);
+      els.hydroCaption.textContent = `${barrierLabel(state.selectedHydroBarrier)} | no finite observed values`;
       return;
     }
 
@@ -750,6 +779,9 @@
     });
 
     els.gtsmCaption.textContent = `${gaugeLabel} | ${modelSurge.length} GTSM hours`;
+    if (!observedSurge.length) {
+      els.gtsmCaption.textContent += ", no observed residual";
+    }
   }
 
   function destroyGtsmChart() {
@@ -1047,7 +1079,11 @@
   }
 
   function gaugeKeyForSelectedBarrier() {
-    return normalizeBarrier(state.selectedHydroBarrier) === "thames" ? "southend" : "rpbu";
+    return gaugeKeyForBarrier(state.selectedHydroBarrier);
+  }
+
+  function gaugeKeyForBarrier(barrier) {
+    return normalizeBarrier(barrier) === "thames" ? "southend" : "rpbu";
   }
 
   function gaugeLabelForSelectedBarrier() {
@@ -1066,7 +1102,7 @@
 
     if (!series || !series.points || !series.points.length) {
       drawCenteredText(ctx, width, height, "No water-level data in this window");
-      els.hydroCaption.textContent = barrierLabel(state.selectedHydroBarrier);
+      els.hydroCaption.textContent = `${barrierLabel(state.selectedHydroBarrier)} | no observed data`;
       return;
     }
 
@@ -1091,7 +1127,7 @@
     });
     if (!values.length) {
       drawCenteredText(ctx, width, height, "No finite values in this window");
-      els.hydroCaption.textContent = barrierLabel(state.selectedHydroBarrier);
+      els.hydroCaption.textContent = `${barrierLabel(state.selectedHydroBarrier)} | no finite observed values`;
       return;
     }
     let yMin = Math.min.apply(null, values);
