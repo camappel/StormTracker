@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Static StormTracker dashboard for browsing existing storm events.">
+  <title>StormTracker Static Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand-block">
+        <p class="eyebrow">StormTracker static</p>
+        <h1>Storm dashboard</h1>
+      </div>
+      <div class="catalog-summary" aria-label="Catalog summary">
+        <div class="summary-tile">
+          <span class="summary-value" id="summary-storms">0</span>
+          <span class="summary-label">Storms</span>
+        </div>
+        <div class="summary-tile">
+          <span class="summary-value" id="summary-closures">0</span>
+          <span class="summary-label">Closures</span>
+        </div>
+        <div class="summary-tile">
+          <span class="summary-value" id="summary-years">0</span>
+          <span class="summary-label">Years</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="dashboard-grid">
+      <aside class="storm-browser" aria-label="Storm browser">
+        <div class="filter-panel">
+          <label class="search-field">
+            <span>Search</span>
+            <input id="storm-search" type="search" placeholder="Storm, year, barrier" autocomplete="off">
+          </label>
+
+          <div class="control-block">
+            <span class="control-label">Barrier</span>
+            <div class="segmented-control" id="barrier-filter" role="group" aria-label="Filter by barrier">
+              <button type="button" class="segment is-active" data-filter="all">All</button>
+              <button type="button" class="segment" data-filter="thames">Thames</button>
+              <button type="button" class="segment" data-filter="es">ES</button>
+              <button type="button" class="segment" data-filter="both">Both</button>
+            </div>
+          </div>
+
+          <div class="filter-row">
+            <label>
+              <span>Storm type</span>
+              <select id="type-filter">
+                <option value="all">All</option>
+                <option value="C0">C0</option>
+                <option value="C1">C1</option>
+                <option value="C2">C2</option>
+                <option value="unset">Unset</option>
+              </select>
+            </label>
+            <label>
+              <span>Sort</span>
+              <select id="sort-select">
+                <option value="date-desc">Newest</option>
+                <option value="date-asc">Oldest</option>
+                <option value="pressure-asc">Lowest pressure</option>
+                <option value="duration-desc">Longest track</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="list-header">
+          <span id="list-count">0 storms</span>
+        </div>
+        <div class="storm-list" id="storm-list" role="listbox" aria-label="Storm list"></div>
+      </aside>
+
+      <section class="storm-detail" aria-live="polite">
+        <div class="detail-header">
+          <div>
+            <div class="badge-row" id="detail-badges"></div>
+            <h2 id="detail-title">Select a storm</h2>
+            <p id="detail-period" class="detail-period"></p>
+          </div>
+          <div class="hydro-switch" id="hydro-switch" role="group" aria-label="Hydrograph barrier"></div>
+        </div>
+
+        <div class="metric-grid" id="metric-grid"></div>
+
+        <section class="panel closure-panel">
+          <div class="panel-heading">
+            <h3>Closures</h3>
+            <span id="closure-caption" class="panel-note"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Barrier</th>
+                  <th>Start</th>
+                  <th>End</th>
+                  <th>High water</th>
+                  <th>Closure ID</th>
+                </tr>
+              </thead>
+              <tbody id="closure-table"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel hydro-panel">
+          <div class="panel-heading">
+            <h3>Hydrograph</h3>
+            <span id="hydro-caption" class="panel-note"></span>
+          </div>
+          <div class="hydro-chart-wrap">
+            <canvas id="hydro-canvas" aria-label="Water level hydrograph"></canvas>
+          </div>
+          <div class="chart-legend" aria-label="Hydrograph marker legend">
+            <span><i class="legend-swatch swatch-window"></i>Closure window</span>
+          </div>
+        </section>
+
+        <section class="panel gtsm-panel">
+          <div class="panel-heading">
+            <h3>GTSM surge comparison</h3>
+            <span id="gtsm-caption" class="panel-note"></span>
+          </div>
+          <div class="gtsm-chart-wrap">
+            <canvas id="gtsm-canvas" aria-label="Observed and GTSM surge comparison"></canvas>
+          </div>
+          <div class="chart-legend" aria-label="GTSM marker legend">
+            <span><i class="legend-swatch swatch-window"></i>Closure window</span>
+          </div>
+        </section>
+
+        <section class="panel frame-panel">
+          <div class="panel-heading">
+            <h3>Cached frames</h3>
+            <span id="frame-caption" class="panel-note"></span>
+          </div>
+          <div class="frame-controls">
+            <button type="button" id="btn-frame-prev" class="frame-step" aria-label="Previous frame">&lt;</button>
+            <label class="frame-slider-field">
+              <span id="frame-timestamp">No cached frames</span>
+              <input id="frame-slider" type="range" min="0" max="0" value="0" step="1" disabled>
+            </label>
+            <button type="button" id="btn-frame-next" class="frame-step" aria-label="Next frame">&gt;</button>
+          </div>
+          <div class="frame-grid" id="frame-grid"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <script src="vendor/chart.umd.js"></script>
+  <script src="vendor/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script src="vendor/chartjs-plugin-annotation.min.js"></script>
+  <script src="data/storm-dashboard-data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
